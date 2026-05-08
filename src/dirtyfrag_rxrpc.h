@@ -1,7 +1,7 @@
 /*
  * DIRTYFAIL — dirtyfrag_rxrpc.h
  *
- * RxRPC variant of Dirty Frag (CVE-2026-43500). Detection only.
+ * RxRPC variant of Dirty Frag (CVE-2026-43500).
  */
 
 #ifndef DIRTYFAIL_DIRTYFRAG_RXRPC_H
@@ -9,6 +9,15 @@
 
 #include "common.h"
 
+/* Precondition probe: kernel + rxrpc.ko + AF_RXRPC openable. */
 df_result_t dirtyfrag_rxrpc_detect(void);
+
+/* Real PoC: brute-force three rxkad session keys K_A, K_B, K_C such
+ * that pcbc(fcrypt)-decrypting /etc/passwd line 1 at offsets 4/6/8
+ * with last-write-wins produces "root::0:0:GGGGGG:/root:/bin/bash".
+ * Then enter a fresh user/net namespace, run the three forged-handshake
+ * splice triggers, and (if do_shell) execve `su -` to drop a root shell
+ * via PAM `pam_unix nullok`. */
+df_result_t dirtyfrag_rxrpc_exploit(bool do_shell);
 
 #endif

