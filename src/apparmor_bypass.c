@@ -263,12 +263,20 @@ int apparmor_bypass_run_stage(int argc, char **argv,
 int apparmor_bypass_fork_arm(int argc, char **argv)
 {
 #ifdef __linux__
+    /* Caller may pass argc=0/argv=NULL; arm_and_relaunch needs a
+     * valid argv[0] for execv. Fabricate a minimal one if needed. */
+    char *fallback[2] = { (char *)"dirtyfail", NULL };
+    if (argc <= 0 || argv == NULL || argv[0] == NULL) {
+        argc = 1;
+        argv = fallback;
+    }
+
     pid_t child = fork();
     if (child < 0) return -1;
     if (child == 0) {
-        /* Child arms the bypass and execs through the stages. The
-         * env vars set by the caller (DIRTYFAIL_INNER_MODE etc.)
-         * survive execv, so stage 2 sees them. */
+        /* Child arms the bypass and execs through the stages. Env
+         * vars set by the caller (DIRTYFAIL_INNER_MODE etc.) survive
+         * execv, so stage 2 sees them. */
         apparmor_bypass_arm_and_relaunch(argc, argv);
         /* arm_and_relaunch only returns on failure. */
         log_bad("child: bypass arm failed: %s", strerror(errno));
