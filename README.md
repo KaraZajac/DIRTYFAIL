@@ -36,11 +36,34 @@ vulnerable system.
   matched to this project so it's instantly identifiable in any
   audit — change `NEW_USER` in `src/backdoor.c` if you need a
   different identifier for an authorized red-team engagement.
-- **`--aa-bypass`** (auto-armed when needed) — defeats Ubuntu's
-  `apparmor_restrict_unprivileged_userns=1` policy via the
-  `change_onexec(crun)` → `change_onexec(chrome)` → `unshare`
-  re-exec dance. Required for the xfrm-ESP / RxRPC / GCM exploit
-  modes on hardened Ubuntu 24.04+.
+- **AppArmor bypass** — defeats Ubuntu's
+  `apparmor_restrict_unprivileged_userns=1` policy via a single-hop
+  `change_onexec("crun")` re-exec into an unconfined profile that
+  retains userns capabilities. Each exploit mode handles this
+  internally via a fork: parent stays in init namespace, child does
+  the bypass dance, parent reads global page cache and runs `su` for
+  REAL init-ns root. The legacy `--aa-bypass` flag still exists for
+  debugging the bypass mechanics in isolation. See [§8.5 Architecture](#85-architecture-outerinner-fork-based-bypass).
+
+## Verified working on
+
+DIRTYFAIL has been **empirically validated end-to-end** on real
+hardware for the following kernels:
+
+| Distro | Kernel | xfrm-ESP v4 | xfrm-ESP v6 | RxRPC | GCM | Backdoor |
+|---|---|:-:|:-:|:-:|:-:|:-:|
+| Ubuntu 24.04 LTS | `6.8.0-111-generic` | ✅ | ✅ | ✅ | ✅¹ | ✅¹ |
+
+¹ GCM and Backdoor require `algif_aead` to be loadable. Ubuntu 24.04
+ships `/etc/modprobe.d/disable-algif_aead.conf` blacklisting it as a
+Copy Fail mitigation. With the blacklist removed (e.g. on a kernel
+predating the mitigation), both modes work end-to-end.
+
+For the RxRPC variant, we proved real init-namespace root by reading
+`/etc/shadow` (`root:*:19962:0:99999:7:::`) after `echo "" | su -`
+returned `uid=0(root)`. For the backdoor mode, `echo "" | su - dirtyfail`
+likewise dropped a real root shell. These are not userns-uid-0 ghosts —
+they are real init-ns root.
 
 > **Authorized testing only.** Use DIRTYFAIL only on systems you own or
 > are explicitly engaged to assess. The exploit modes corrupt
@@ -60,6 +83,7 @@ vulnerable system.
 6. [Usage](#6-usage)
 7. [How DIRTYFAIL detects each CVE](#7-how-dirtyfail-detects-each-cve)
 8. [How DIRTYFAIL exploits each CVE](#8-how-dirtyfail-exploits-each-cve)
+8.5. [Architecture: outer/inner fork-based bypass](#85-architecture-outerinner-fork-based-bypass)
 9. [Mitigations](#9-mitigations)
 10. [Ethics & disclosure](#10-ethics--disclosure)
 11. [Credits](#11-credits)
@@ -391,7 +415,9 @@ Modes (pick one; default is --scan):
   --exploit-backdoor     PERSISTENT: insert dirtyfail::0:0:..:/:/bin/bash uid-0 user
   --cleanup              evict /etc/passwd from page cache and drop_caches
   --cleanup-backdoor     restore /etc/passwd line from /var/tmp/.dirtyfail.state
-  --aa-bypass            force AppArmor unprivileged-userns bypass
+  --aa-bypass            (DEBUG ONLY) arm a legacy whole-process AA bypass.
+                         Exploit modes do their own fork-based bypass and do
+                         NOT need this flag — see §8.5 Architecture.
 
 Options:
   --no-shell             after a successful exploit, do NOT execve `su`;
@@ -594,6 +620,106 @@ final step as Copy Fail.
 
 ---
 
+## 8.5 Architecture: outer/inner fork-based bypass
+
+All five exploit modes share a common architecture for handling
+Ubuntu's `apparmor_restrict_unprivileged_userns=1` policy without
+trapping the post-exploit `su` inside a userns where it can't reach
+real init-ns root.
+
+### The problem
+
+A naive bypass puts the *whole* `dirtyfail` process inside a fresh
+user namespace via `unshare(CLONE_NEWUSER)`. That's enough to register
+XFRM SAs and fire splice triggers — but it also means the eventual
+`execlp("su", user)` runs inside the userns, where uid 0 is mapped via
+`uid_map "0 1000 1"` to the operator's outer uid (1000). PAM's
+`setresuid(0)` then lands at userns-uid-0-mapped-to-1000, which is
+**not** real init-ns root — `cat /etc/shadow` returns EACCES, the
+shell can't actually do privileged operations.
+
+### The fix: outer/inner split
+
+```
+parent (dirtyfail, init ns)                 child (bypass userns)
+─────────────────────────                   ─────────────────────
+prompts (DIRTYFAIL / YES_BREAK_SSH)
+resolve target (uid_off, K_A/K_B/K_C, ...)
+setenv DIRTYFAIL_INNER_MODE=...
+setenv DIRTYFAIL_TARGET_USER=...
+fork ─────────────────────────────────────► change_onexec("crun")
+                                             execv self ─► STAGE-1
+                                                            execv self ─► STAGE-2
+                                                                          unshare(USER|NET)
+                                                                          uid_map / capset
+                                                                          ifup lo
+                                                                          main() detects INNER_MODE
+                                                                          dispatch <mode>_inner()
+                                                                          register XFRM SA
+                                                                          splice trigger → page cache STORE
+                                                                          _exit(DF_EXPLOIT_OK)
+waitpid ◄───────────────────────────────── (child reaped)
+read /etc/passwd (page cache is global)
+verify modification visible
+if do_shell:
+  execlp("su", user) ← runs IN INIT NS
+                       PAM auth → setresuid(0)
+                       → REAL init-ns root shell
+else:
+  try_revert_passwd_page_cache
+```
+
+The parent **never enters a user namespace**. The child does the
+bypass + kernel work, modifies the global page cache (which is shared
+across namespaces — the only "bridge" we need), and exits. The
+parent's `su` is then a normal init-namespace setresuid call.
+
+### Parent → child handoff via env vars
+
+`execv` preserves the environment, so the parent stashes the
+operation parameters in env vars before forking. Each mode defines
+its own:
+
+| Mode | Env vars |
+|---|---|
+| `esp` / `esp6` / `gcm` | `DIRTYFAIL_INNER_MODE`, `DIRTYFAIL_TARGET_USER` |
+| `rxrpc` | `DIRTYFAIL_INNER_MODE=rxrpc`, `DIRTYFAIL_K_{A,B,C}` (hex) — fcrypt brute force happens in the parent (no caps needed); the keys are passed to the child for the actual triggers |
+| `backdoor-install` / `backdoor-cleanup` | `DIRTYFAIL_INNER_MODE`, `DIRTYFAIL_LINE_OFF`, `VICTIM_LINE`, `TARGET_LINE` |
+
+After stage 2 of the bypass completes, `main()` checks
+`DIRTYFAIL_INNER_MODE` and dispatches to `<mode>_exploit_inner()`. The
+inner does *only* the kernel work (no prompts, no fork, no `su`) and
+exits with the result code. The parent reaps it via `waitpid` and
+proceeds with verification.
+
+### Why the single-hop bypass
+
+The earlier two-hop dance (`change_onexec("crun")` → `change_onexec("chrome")`)
+caused intermittent `ENOSPC` failures on Ubuntu 24.04 in our exec
+chain (likely a per-profile userns-accounting wrinkle). The single
+hop into `crun` is sufficient — `crun`'s AppArmor profile has
+`flags=(unconfined)` and explicit `userns,` permission, so unshare
+succeeds and stays succeeded.
+
+### Why no infinite re-exec loop
+
+After stage 2 completes successfully, a process-local
+`g_bypass_done` flag is set. If `apparmor_bypass_needed()` is called
+again in the same process, it short-circuits to `false`, preventing
+the post-exploit code from re-arming and nesting another userns
+layer (which previously hit the per-userns nesting cap as `ENOSPC`).
+
+### `--aa-bypass` is now a debug-only flag
+
+In the old architecture, `--aa-bypass` armed a whole-process bypass
+before the exploit dispatch. In the new architecture, exploit modes
+do their *own* fork-based bypass internally; the flag is no longer
+needed for normal use. It's retained for debugging the bypass
+mechanics in isolation (e.g. running `--scan` inside a bypass
+userns), with a warning that it may break post-exploit `su`.
+
+---
+
 ## 9. Mitigations
 
 ### Copy Fail (CVE-2026-31431)
@@ -731,15 +857,33 @@ default profile applied to unprivileged binaries lets `unshare(USER)`
 succeed but **strips CAP_NET_ADMIN** in the new namespace. XFRM SA
 registration then fails silently.
 
-DIRTYFAIL detects this at startup of any userns-needing exploit mode
-and arms a re-exec via `change_onexec("crun")` → `change_onexec("chrome")`.
-Both profiles are unconfined; the kernel hands us full caps in the
-new namespace. `--aa-bypass` forces the bypass; without that flag
-it auto-arms only when a restrictive profile is detected.
+The bypass: write `"exec crun"` to `/proc/self/attr/exec` and
+`execv` to switch into AppArmor's `crun` profile, which has
+`flags=(unconfined)` and explicit `userns,` permission. After the
+exec, `unshare(CLONE_NEWUSER | CLONE_NEWNET)` succeeds with full
+caps inside the new namespace.
 
-The technique is from `aa-rootns.c` by 0xdeadbeefnetwork (credited
-there to Brad Spengler / grsecurity). Reimplemented in DIRTYFAIL
-structure with profile-probing and graceful fallback.
+DIRTYFAIL handles this *per-exploit-mode* via a fork: parent stays
+in init namespace, child does the bypass + kernel work, parent
+reads global page cache and runs `su` for real init-ns root. See
+[§8.5 Architecture](#85-architecture-outerinner-fork-based-bypass)
+for the full chain. The legacy `--aa-bypass` flag (which armed the
+bypass for the whole process) is retained for debugging only.
+
+The original technique is from `aa-rootns.c` by 0xdeadbeefnetwork
+(credited there to Brad Spengler / grsecurity). DIRTYFAIL's
+implementation:
+
+- Detects the restriction via the
+  `kernel.apparmor_restrict_unprivileged_userns` sysctl rather than
+  by reading `/proc/self/attr/current` (which still shows
+  "unconfined" on Ubuntu 24.04 even when the policy is restricting).
+- Uses a single hop into `crun` rather than the two-hop
+  `crun → chrome` dance — the second hop caused intermittent
+  `ENOSPC` on Ubuntu 24.04.
+- Sets a process-local `g_bypass_done` flag after stage 2 so re-checks
+  short-circuit (preventing infinite re-exec loops that previously
+  exhausted the per-userns nesting cap).
 
 ---
 
