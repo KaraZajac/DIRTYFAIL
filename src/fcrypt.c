@@ -223,12 +223,25 @@ bool fcrypt_selftest(void)
     fcrypt_ctx ctx;
     uint8_t out[8];
 
-    /* Vector 1: all-zero key, ciphertext known. */
+    /* Vector 1: all-zero key. Catches gross structural bugs but the
+     * key schedule produces all-zero round keys, so it can't catch
+     * subtle bugs in the 7-bit packing or 11-bit rotation. */
     static const uint8_t k1[8] = {0,0,0,0,0,0,0,0};
     static const uint8_t c1[8] = {0x0E,0x09,0x00,0xC7,0x3E,0xF7,0xED,0x41};
     fcrypt_setkey(&ctx, k1);
     fcrypt_decrypt(&ctx, out, c1);
     if (memcmp(out, "\x00\x00\x00\x00\x00\x00\x00\x00", 8) != 0)
+        return false;
+
+    /* Vector 2: non-zero key, exercises every byte of the key schedule
+     * and round-key emit. Pulled from the kernel's crypto/testmgr.h
+     * fcrypt-pcbc test vector. */
+    static const uint8_t k2[8] = {0x11,0x44,0x77,0xAA,0xDD,0x00,0x33,0x66};
+    static const uint8_t c2[8] = {0xD8,0xED,0x78,0x74,0x77,0xEC,0x06,0x80};
+    static const uint8_t p2[8] = {0x12,0x34,0x56,0x78,0x9A,0xBC,0xDE,0xF0};
+    fcrypt_setkey(&ctx, k2);
+    fcrypt_decrypt(&ctx, out, c2);
+    if (memcmp(out, p2, 8) != 0)
         return false;
 
     return true;

