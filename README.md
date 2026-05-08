@@ -83,7 +83,7 @@ they are real init-ns root.
 6. [Usage](#6-usage)
 7. [How DIRTYFAIL detects each CVE](#7-how-dirtyfail-detects-each-cve)
 8. [How DIRTYFAIL exploits each CVE](#8-how-dirtyfail-exploits-each-cve)
-8.5. [Architecture: outer/inner fork-based bypass](#85-architecture-outerinner-fork-based-bypass)
+    - [8.5 Architecture: outer/inner fork-based bypass](#85-architecture-outerinner-fork-based-bypass)
 9. [Mitigations](#9-mitigations)
 10. [Ethics & disclosure](#10-ethics--disclosure)
 11. [Credits](#11-credits)
