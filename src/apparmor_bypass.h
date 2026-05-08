@@ -64,6 +64,25 @@ bool apparmor_bypass_needed(void);
  * before deciding whether to fork+unshare on their own. */
 bool apparmor_bypass_was_armed(void);
 
+/* Fork a child that arms the AA bypass and re-execs itself through
+ * the stages. The child eventually lands inside a fresh user/net
+ * namespace with full caps; main() in that re-exec'd image dispatches
+ * to the inner-mode handler indicated by the DIRTYFAIL_INNER_MODE
+ * environment variable.
+ *
+ * The PARENT stays in the init namespace and waits for the child via
+ * waitpid. After the child exits, the parent can read the global
+ * page cache (which reflects whatever the child modified) and then
+ * execlp("su", ...) in init namespace to reach REAL init-ns root —
+ * this is the whole point of the outer/inner split.
+ *
+ * Caller must setenv("DIRTYFAIL_INNER_MODE", "...", 1) and any other
+ * mode-specific env vars BEFORE calling this. The child inherits the
+ * full environment.
+ *
+ * Returns the child's exit code on success. -1 on fork failure. */
+int apparmor_bypass_fork_arm(int argc, char **argv);
+
 /* Trigger the bypass: change_onexec(crun) then re-exec self with stage
  * markers. Caller passes the argv it wants to resume with (stage 2 will
  * hand that argv back via apparmor_bypass_run_stage's out_argv).

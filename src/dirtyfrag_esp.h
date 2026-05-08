@@ -16,12 +16,16 @@
  * prerequisites are satisfied. */
 df_result_t dirtyfrag_esp_detect(void);
 
-/* Real PoC: chain unshare(USER|NET) → register an XFRM SA carrying our
- * marker bytes in seq_hi → trigger esp_input via UDP-encap+splice on
- * the /etc/passwd page cache, flipping the calling user's 4-digit UID
- * to "0000". Identical end-state to copyfail_exploit() but reaches it
- * via the xfrm path, so it works on systems that have the algif_aead
- * Copy Fail mitigation in place. */
+/* OUTER (init namespace): user prompts → resolve target → fork →
+ * wait for child to do the kernel work → read global page cache to
+ * verify → if do_shell, execlp("su", user) in init ns for REAL
+ * init-ns root via PAM. */
 df_result_t dirtyfrag_esp_exploit(bool do_shell);
+
+/* INNER (bypass userns): runs after AA bypass stage 2. Reads
+ * DIRTYFAIL_TARGET_USER from env, registers XFRM SA with seq_hi
+ * "0000", fires the splice trigger. No prompts, no su, no verify —
+ * the parent owns those. Exits with df_result_t cast to int. */
+df_result_t dirtyfrag_esp_exploit_inner(void);
 
 #endif

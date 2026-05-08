@@ -260,6 +260,33 @@ int apparmor_bypass_run_stage(int argc, char **argv,
     return -1;
 }
 
+int apparmor_bypass_fork_arm(int argc, char **argv)
+{
+#ifdef __linux__
+    pid_t child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        /* Child arms the bypass and execs through the stages. The
+         * env vars set by the caller (DIRTYFAIL_INNER_MODE etc.)
+         * survive execv, so stage 2 sees them. */
+        apparmor_bypass_arm_and_relaunch(argc, argv);
+        /* arm_and_relaunch only returns on failure. */
+        log_bad("child: bypass arm failed: %s", strerror(errno));
+        _exit(1);
+    }
+    int wstat = 0;
+    if (waitpid(child, &wstat, 0) < 0) return -1;
+    if (WIFEXITED(wstat)) return WEXITSTATUS(wstat);
+    if (WIFSIGNALED(wstat)) {
+        log_bad("child killed by signal %d", WTERMSIG(wstat));
+        return -1;
+    }
+    return -1;
+#else
+    (void)argc; (void)argv; return -1;
+#endif
+}
+
 int apparmor_bypass_arm_and_relaunch(int argc, char **argv)
 {
 #ifdef __linux__
