@@ -145,15 +145,22 @@ struct rxkad_challenge_payload {
     uint32_t __padding;
 } __attribute__((packed));
 
-/* sockaddr_rxrpc is in <linux/rxrpc.h>; fallback below. */
+/* sockaddr_rxrpc is in <linux/rxrpc.h>; fallback below.
+ *
+ * IMPORTANT: the kernel's struct sockaddr_rxrpc has the transport union
+ * sized to include sockaddr_in6 (28 B), making the total 36 B. The
+ * rxrpc_bind() syscall rejects with -EINVAL if len < sizeof(struct
+ * sockaddr_rxrpc), so even when we only use the v4 path we MUST send
+ * 36 bytes — hence the in6 member below. */
 struct dfr_sockaddr_rxrpc {
     uint16_t srx_family;
     uint16_t srx_service;
     uint16_t transport_type;
     uint16_t transport_len;
     union {
-        uint16_t family;
-        struct sockaddr_in sin;
+        uint16_t           family;
+        struct sockaddr_in  sin;
+        struct sockaddr_in6 sin6;
     } transport;
 };
 
@@ -430,14 +437,23 @@ static int compute_cksum(uint32_t cid, uint32_t call_id, uint32_t seq,
 static int setup_rxrpc_client(uint16_t local_port, const char *keyname)
 {
     int fd = socket(AF_RXRPC, SOCK_DGRAM, PF_INET);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        log_bad("socket(AF_RXRPC): %s", strerror(errno));
+        return -1;
+    }
 
     if (setsockopt(fd, SOL_RXRPC, RXRPC_SECURITY_KEY,
-                   keyname, strlen(keyname)) < 0) { close(fd); return -1; }
+                   keyname, strlen(keyname)) < 0) {
+        log_bad("setsockopt RXRPC_SECURITY_KEY: %s", strerror(errno));
+        close(fd); return -1;
+    }
 
     int level = RXRPC_SECURITY_AUTH;
     if (setsockopt(fd, SOL_RXRPC, RXRPC_MIN_SECURITY_LEVEL,
-                   &level, sizeof(level)) < 0) { close(fd); return -1; }
+                   &level, sizeof(level)) < 0) {
+        log_bad("setsockopt RXRPC_MIN_SECURITY_LEVEL: %s", strerror(errno));
+        close(fd); return -1;
+    }
 
     struct dfr_sockaddr_rxrpc srx;
     memset(&srx, 0, sizeof(srx));
@@ -449,6 +465,7 @@ static int setup_rxrpc_client(uint16_t local_port, const char *keyname)
     srx.transport.sin.sin_port        = htons(local_port);
     srx.transport.sin.sin_addr.s_addr = htonl(0x7f000001);
     if (bind(fd, (struct sockaddr *)&srx, sizeof(srx)) < 0) {
+        log_bad("bind AF_RXRPC :%u: %s", local_port, strerror(errno));
         close(fd); return -1;
     }
     return fd;
