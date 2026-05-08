@@ -64,8 +64,9 @@ The following DIRTYFAIL features draw on techniques first published by
   to Brad Spengler (grsecurity); we expose it as a `--aa-bypass` flag
   and auto-arm it when a restrictive profile is detected.
 - `src/backdoor.c` — length-matched overwrite of a `nologin` line in
-  /etc/passwd with `sick::0:0:<pad>:/:/bin/bash`. cf2 publishes the
-  shell-script harness; DIRTYFAIL ports it into a single C function
-  driving our 1-byte primitive.
+  /etc/passwd with `dirtyfail::0:0:<pad>:/:/bin/bash`. cf2 publishes
+  the shell-script harness (and uses the username `sick`); DIRTYFAIL
+  ports it into a single C function driving our 1-byte primitive,
+  with the username matched to this project for easy auditing.
 
 See [README §11 — Credits](README.md#11-credits) for the full list.

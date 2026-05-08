@@ -6,13 +6,19 @@
  * MORE INVASIVE than the UID-flip exploits in copyfail.c /
  * dirtyfrag_esp.c / dirtyfrag_rxrpc.c. Where those modify the calling
  * user's UID for one shell session, this mode inserts a brand-new
- * passwordless uid-0 user "sick" by length-matched overwrite of an
- * existing nologin/false/sync line. The substituted line stays in the
- * page cache until eviction, so:
+ * passwordless uid-0 user "dirtyfail" by length-matched overwrite of
+ * an existing nologin/false/sync line. The substituted line stays in
+ * the page cache until eviction, so:
  *
  *     ./dirtyfail --exploit-backdoor    # install + drop into root
  *     exit                              # back to your normal shell
- *     su - sick                         # any user, any time → root
+ *     su - dirtyfail                    # any user, any time → root
+ *
+ * The username "dirtyfail" is intentionally chosen to match this
+ * project — anyone auditing /etc/passwd will spot it immediately,
+ * which is the opposite of stealth-by-default. If you need an
+ * undetectable backdoor for an authorized red-team engagement,
+ * change NEW_USER in backdoor.c.
  *
  * The on-disk /etc/passwd is unchanged. State (LINE_OFF, original
  * VICTIM_LINE) is persisted at /var/tmp/.dirtyfail.state so that

@@ -30,8 +30,12 @@ vulnerable system.
 
 - **`--exploit-backdoor`** — persistent uid-0 backdoor: length-matched
   overwrite of a `nologin`/`false`/`sync` line in `/etc/passwd` with
-  `sick::0:0:<pad>:/:/bin/bash`. Survives shell exit until page is
-  evicted. State stashed at `/var/tmp/.dirtyfail.state` for `--cleanup-backdoor`.
+  `dirtyfail::0:0:<pad>:/:/bin/bash`. Survives shell exit until page
+  is evicted. State stashed at `/var/tmp/.dirtyfail.state` for
+  `--cleanup-backdoor`. The `dirtyfail` username is deliberately
+  matched to this project so it's instantly identifiable in any
+  audit — change `NEW_USER` in `src/backdoor.c` if you need a
+  different identifier for an authorized red-team engagement.
 - **`--aa-bypass`** (auto-armed when needed) — defeats Ubuntu's
   `apparmor_restrict_unprivileged_userns=1` policy via the
   `change_onexec(crun)` → `change_onexec(chrome)` → `unshare`
@@ -384,7 +388,7 @@ Modes (pick one; default is --scan):
   --exploit-rxrpc        real PoC: empty /etc/passwd root pwd via rxkad
                          (fcrypt brute-force + AF_RXRPC handshake forgery)
   --exploit-gcm          real PoC: flip /etc/passwd UID via rfc4106(gcm(aes))
-  --exploit-backdoor     PERSISTENT: insert sick::0:0:..:/:/bin/bash uid-0 user
+  --exploit-backdoor     PERSISTENT: insert dirtyfail::0:0:..:/:/bin/bash uid-0 user
   --cleanup              evict /etc/passwd from page cache and drop_caches
   --cleanup-backdoor     restore /etc/passwd line from /var/tmp/.dirtyfail.state
   --aa-bypass            force AppArmor unprivileged-userns bypass
@@ -705,9 +709,16 @@ backdoor mode feasible.
 
 `--exploit-backdoor` picks the longest `/etc/passwd` line whose shell
 is in `{nologin, false, sync}` and overwrites it byte-by-byte with
-`sick::0:0:<pad>:/:/bin/bash` (length-matched). After installation,
-`su - sick` from any user drops a root shell — no password prompt —
+`dirtyfail::0:0:<pad>:/:/bin/bash` (length-matched). After installation,
+`su - dirtyfail` from any user drops a root shell — no password prompt —
 because `pam_unix.so nullok` accepts the empty password field.
+
+The username `dirtyfail` is intentionally branded to this project so
+it's *easy to detect* in any subsequent audit — defenders running
+`grep dirtyfail /etc/passwd` (or any HIDS doing the same) will spot
+the line immediately. If you need a different identifier for a
+specific red-team engagement, change `NEW_USER` and `DF_PREFIX` in
+`src/backdoor.c`.
 
 The on-disk file is unchanged; the substitution lives in the page
 cache only. `--cleanup-backdoor` restores the original line via the
