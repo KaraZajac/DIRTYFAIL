@@ -87,22 +87,31 @@
 #ifdef __linux__
 #include <sys/syscall.h>
 #include <netinet/in.h>
+#include <netinet/udp.h>
 #include <arpa/inet.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/xfrm.h>
+#include <linux/udp.h>
 #include <linux/if.h>
 #include <sys/ioctl.h>
 #endif
 
-/* These are guaranteed to exist on Linux but the macOS analyzer needs
- * stubs to parse the file. The bodies are wrapped in __linux__ guards. */
+/* Some of these are in <linux/udp.h> on modern Linux but missing on
+ * macOS / older glibc — provide fallbacks so this compiles everywhere. */
+#ifndef UDP_ENCAP
+#define UDP_ENCAP             100
+#endif
+#ifndef UDP_ENCAP_ESPINUDP
+#define UDP_ENCAP_ESPINUDP      2
+#endif
+#ifndef IPPROTO_ESP
+#define IPPROTO_ESP            50
+#endif
+
 #ifndef __linux__
 #define CLONE_NEWUSER 0x10000000
 #define CLONE_NEWNET  0x40000000
-#define UDP_ENCAP             100
-#define UDP_ENCAP_ESPINUDP      2
-#define IPPROTO_ESP            50
 #define IFF_UP               0x01
 #define IFF_RUNNING          0x40
 #define SIOCSIFFLAGS     0x8914
@@ -191,25 +200,14 @@ static bool write_proc(const char *path, const char *value)
     return got == want;
 }
 
-/* ---- Netlink helpers ---------------------------------------------- *
+/* ---- Netlink XFRM SA registration --------------------------------- *
  *
  * The XFRM SA registration is built by hand. Each attribute is a 4-byte
  * aligned struct rtattr { u16 rta_len; u16 rta_type; } followed by
  * payload. The total nlmsg length is filled in last.
+ *
+ * Register an XFRM_MSG_NEWSA carrying our marker in replay_esn.seq_hi.
  */
-
-static void nl_add_attr(char *buf, size_t *len, unsigned short type,
-                        const void *data, unsigned short dlen)
-{
-    struct rtattr *r = (struct rtattr *)(buf + *len);
-    r->rta_type = type;
-    r->rta_len  = RTA_LENGTH(dlen);
-    if (data) memcpy(RTA_DATA(r), data, dlen);
-    else      memset(RTA_DATA(r), 0, dlen);
-    *len += RTA_SPACE(dlen);
-}
-
-/* Register an XFRM_MSG_NEWSA carrying our marker in replay_esn.seq_hi. */
 static bool xfrm_register_sa(int nl, const unsigned char seq_hi[4])
 {
     char buf[2048] = {0};

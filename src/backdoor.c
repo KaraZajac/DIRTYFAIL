@@ -127,11 +127,15 @@ static bool save_state(off_t line_off, const char *victim_line, size_t len)
     char buf[2048];
     int n = snprintf(buf, sizeof(buf), "LINE_OFF=%lld\nVICTIM_LEN=%zu\nVICTIM_LINE=",
                      (long long)line_off, len);
-    write(fd, buf, n);
-    write(fd, victim_line, len);
-    write(fd, "\n", 1);
+    bool ok = (write(fd, buf, n)            == n)
+           && (write(fd, victim_line, len)  == (ssize_t)len)
+           && (write(fd, "\n", 1)           == 1);
     close(fd);
-    return true;
+    if (!ok) {
+        log_bad("save_state write: %s", strerror(errno));
+        unlink(STATE_FILE);
+    }
+    return ok;
 }
 
 static bool load_state(off_t *line_off, char *victim_line, size_t cap, size_t *len)

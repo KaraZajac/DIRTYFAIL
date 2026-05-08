@@ -11,7 +11,12 @@
 #ifndef DIRTYFAIL_COMMON_H
 #define DIRTYFAIL_COMMON_H
 
+/* The Makefile passes -D_GNU_SOURCE on the command line; this guard
+ * keeps gcc from warning about a duplicate definition when callers
+ * include common.h after the cmdline -D has already taken effect. */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <errno.h>
 #include <stdarg.h>
 #include <stdbool.h>

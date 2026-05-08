@@ -228,9 +228,13 @@ int open_and_cache(const char *path)
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
     /* Force a read so the page is in the cache. The exploit primitives
-     * all assume the target page is already populated. */
+     * all assume the target page is already populated. We don't care
+     * what the bytes are or whether read returns short — only that the
+     * kernel pulled the page into the cache as a side effect. */
     char tmp[4096];
-    (void)read(fd, tmp, sizeof(tmp));
+    if (read(fd, tmp, sizeof(tmp)) < 0) {
+        /* primer failed; caller's splice will surface a useful errno. */
+    }
     lseek(fd, 0, SEEK_SET);
     return fd;
 }
