@@ -38,6 +38,11 @@ static void vlog(FILE *out, const char *prefix, const char *color,
         fprintf(out, "%s ", prefix);
     vfprintf(out, fmt, ap);
     fputc('\n', out);
+    /* Flush — when stdout is piped (e.g. through ssh, timeout, tee)
+     * the default fully-buffered mode hides log lines until either the
+     * process exits cleanly or 4 KiB accumulates. We log to follow
+     * progress; visibility wins over throughput here. */
+    fflush(out);
 }
 
 #define LOG_FN(name, prefix, color, stream)                                 \
