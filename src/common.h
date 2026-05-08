@@ -128,6 +128,12 @@ bool find_passwd_uid_field(const char *username,
 /* Drop the kernel page cache. Requires root. */
 bool drop_caches(void);
 
+/* Best-effort eviction of /etc/passwd from page cache. Tries
+ * POSIX_FADV_DONTNEED, then `sudo drop_caches` as belt-and-suspenders.
+ * Returns true if at least one path succeeded. See common.c for
+ * caveats. */
+bool try_revert_passwd_page_cache(void);
+
 /* Print a hex+ASCII dump (max `len` bytes). For debug output. */
 void hex_dump(const unsigned char *buf, size_t len);
 
