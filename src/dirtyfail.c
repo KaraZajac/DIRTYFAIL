@@ -131,9 +131,13 @@ int main(int argc, char **argv)
         const char *inner = getenv("DIRTYFAIL_INNER_MODE");
         if (inner && *inner) {
             df_result_t r = DF_TEST_ERROR;
-            if (strcmp(inner, "esp") == 0) {
-                r = dirtyfrag_esp_exploit_inner();
-            } else {
+            if      (strcmp(inner, "esp")              == 0) r = dirtyfrag_esp_exploit_inner();
+            else if (strcmp(inner, "esp6")             == 0) r = dirtyfrag_esp6_exploit_inner();
+            else if (strcmp(inner, "rxrpc")            == 0) r = dirtyfrag_rxrpc_exploit_inner();
+            else if (strcmp(inner, "gcm")              == 0) r = copyfail_gcm_exploit_inner();
+            else if (strcmp(inner, "backdoor-install") == 0) r = backdoor_install_inner();
+            else if (strcmp(inner, "backdoor-cleanup") == 0) r = backdoor_cleanup_inner();
+            else {
                 fprintf(stderr, "unknown DIRTYFAIL_INNER_MODE: %s\n", inner);
                 r = DF_TEST_ERROR;
             }

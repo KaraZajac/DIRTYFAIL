@@ -19,5 +19,6 @@ df_result_t dirtyfrag_rxrpc_detect(void);
  * splice triggers, and (if do_shell) execve `su -` to drop a root shell
  * via PAM `pam_unix nullok`. */
 df_result_t dirtyfrag_rxrpc_exploit(bool do_shell);
+df_result_t dirtyfrag_rxrpc_exploit_inner(void);
 
 #endif

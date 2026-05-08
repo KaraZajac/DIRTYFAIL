@@ -28,6 +28,10 @@
 #include "common.h"
 
 df_result_t dirtyfrag_esp6_detect(void);
+
+/* OUTER (init ns): prompts → fork → wait → verify → su.
+ * INNER (bypass userns): SA reg + trigger only. */
 df_result_t dirtyfrag_esp6_exploit(bool do_shell);
+df_result_t dirtyfrag_esp6_exploit_inner(void);
 
 #endif

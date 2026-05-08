@@ -42,4 +42,14 @@
 df_result_t backdoor_install(bool do_shell);
 df_result_t backdoor_cleanup(void);
 
+/* INNER variants — run inside the AA bypass userns. The inner reads
+ * the operation parameters from env vars set by the outer:
+ *   DIRTYFAIL_INNER_MODE        = backdoor-install | backdoor-cleanup
+ *   DIRTYFAIL_LINE_OFF          = byte offset of the victim line
+ *   DIRTYFAIL_VICTIM_LINE       = original /etc/passwd line bytes
+ *   DIRTYFAIL_TARGET_LINE       = (install only) replacement bytes
+ */
+df_result_t backdoor_install_inner(void);
+df_result_t backdoor_cleanup_inner(void);
+
 #endif

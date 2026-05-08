@@ -39,6 +39,7 @@ df_result_t copyfail_gcm_detect(void);
  * Equivalent functional outcome to copyfail_exploit() and
  * dirtyfrag_esp_exploit() — different kernel path. */
 df_result_t copyfail_gcm_exploit(bool do_shell);
+df_result_t copyfail_gcm_exploit_inner(void);
 
 /* Low-level building block exposed for backdoor.c:
  * write a single byte at `target_path` offset `target_off`. The caller

