@@ -82,16 +82,33 @@ static bool write_proc(const char *path, const char *value)
 bool apparmor_bypass_needed(void)
 {
 #ifdef __linux__
-    /* Quick read of the current AppArmor context. */
-    int fd = open("/proc/self/attr/current", O_RDONLY);
-    if (fd < 0) return false;     /* AppArmor not present at all → not needed */
+    /* First check the kernel sysctl. On Ubuntu 24.04 and similar
+     * hardened distros, `kernel.apparmor_restrict_unprivileged_userns=1`
+     * silently strips caps inside ANY userns we create — REGARDLESS of
+     * whether /proc/self/attr/current shows "unconfined". This sysctl
+     * is the authoritative signal; it short-circuits the probe. */
+    int fd = open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", O_RDONLY);
+    if (fd >= 0) {
+        char b[8] = {0};
+        ssize_t n = read(fd, b, sizeof(b) - 1);
+        close(fd);
+        if (n > 0 && b[0] == '1') return true;
+    }
+
+    /* No global sysctl restriction. AppArmor may still be enforcing
+     * a per-profile rule, so check /proc/self/attr/current. If that
+     * file is missing entirely, AppArmor isn't loaded → no bypass. */
+    fd = open("/proc/self/attr/current", O_RDONLY);
+    if (fd < 0) return false;
     char buf[256];
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
     if (n <= 0) return false;
     buf[n] = '\0';
 
-    /* "unconfined" → no AppArmor restrictions; bypass not needed. */
+    /* "unconfined" with no global sysctl restriction → no bypass needed.
+     * NOTE: we already excluded the Ubuntu 24.04 case above; only here
+     * if the sysctl is 0 or the sysctl file doesn't exist. */
     if (strncmp(buf, "unconfined", 10) == 0) return false;
 
     /* Anything else (including "(enforce)" and "(complain)") is
@@ -149,14 +166,15 @@ int apparmor_bypass_run_stage(int argc, char **argv,
     if (argc < 2) return -1;
 
     if (strcmp(argv[1], AA_STAGE1_TAG) == 0) {
-        /* We are now under whichever profile change_onexec switched
-         * us to (typically `crun`). Hop again to `chrome` for an extra
-         * layer of "definitely unconfined", then re-exec with STAGE2.
-         *
-         * If `chrome` doesn't exist, the kernel silently keeps us in
-         * crun — that's fine, crun is already unconfined for our
-         * needs. */
-        change_onexec("chrome");
+        /* We are now in the `crun` profile (unconfined + userns).
+         * Originally we did a second hop to `chrome` for extra paranoia,
+         * mirroring aa-rootns; in practice that hop fails on Ubuntu
+         * 24.04 with ENOSPC from the subsequent unshare for reasons
+         * that aren't fully understood (possibly a per-profile userns
+         * accounting wrinkle). One hop into crun is sufficient — crun
+         * already has `userns,` and `flags=(unconfined)`, so unshare
+         * works and we keep things simple. Just re-exec with STAGE2
+         * to drop into the unshare+capset step. */
         argv[1] = (char *)AA_STAGE2_TAG;
         execv("/proc/self/exe", argv);
         return -1;   /* execv only returns on failure */
