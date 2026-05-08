@@ -58,6 +58,12 @@ int apparmor_bypass_run_stage(int argc, char **argv,
  * CAP_NET_ADMIN inside a fresh user namespace? Returns true if YES. */
 bool apparmor_bypass_needed(void);
 
+/* True iff stage 2 of the bypass ran successfully in this process —
+ * i.e. we're now inside a fresh user/net namespace with full caps,
+ * and any further unshare() would nest. Exploit modules check this
+ * before deciding whether to fork+unshare on their own. */
+bool apparmor_bypass_was_armed(void);
+
 /* Trigger the bypass: change_onexec(crun) then re-exec self with stage
  * markers. Caller passes the argv it wants to resume with (stage 2 will
  * hand that argv back via apparmor_bypass_run_stage's out_argv).

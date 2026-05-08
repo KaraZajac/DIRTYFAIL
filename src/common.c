@@ -223,6 +223,43 @@ bool typed_confirm(const char *expected)
     return strcmp(buf, expected) == 0;
 }
 
+static uid_t read_outer_id(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return (uid_t)-1;
+    char buf[256];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0) return (uid_t)-1;
+    buf[n] = '\0';
+    /* Format: "<inner> <outer> <count>". For init namespace, this is
+     * "0 0 4294967295" — outer == 0 == real root. For our userns it's
+     * "0 1000 1" — outer == 1000 == real uid. */
+    int inner = -1, outer = -1, count = 0;
+    if (sscanf(buf, "%d %d %d", &inner, &outer, &count) != 3 || inner != 0)
+        return (uid_t)-1;
+    return (uid_t)outer;
+}
+
+uid_t real_uid_for_target(void)
+{
+    uid_t outer = read_outer_id("/proc/self/uid_map");
+    /* If we're root in the init namespace OR no userns — return getuid().
+     * The init namespace map shows "0 0 4294967295" → outer=0; only
+     * trust an outer != 0 (and != -1) as the bypass-userns case. */
+    if (outer == (uid_t)-1) return getuid();
+    if (outer == 0) return getuid();
+    return outer;
+}
+
+gid_t real_gid_for_target(void)
+{
+    uid_t outer = read_outer_id("/proc/self/gid_map");
+    if (outer == (uid_t)-1) return getgid();
+    if (outer == 0) return getgid();
+    return (gid_t)outer;
+}
+
 int open_and_cache(const char *path)
 {
     int fd = open(path, O_RDONLY);

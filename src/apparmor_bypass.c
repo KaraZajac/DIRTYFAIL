@@ -46,6 +46,8 @@
  */
 static bool g_bypass_done = false;
 
+bool apparmor_bypass_was_armed(void) { return g_bypass_done; }
+
 /* ---------------------------------------------------------------- *
  * Profile switch primitive
  *
