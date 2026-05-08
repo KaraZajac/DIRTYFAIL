@@ -46,4 +46,26 @@ mechanics (XFRM SA layout, RxRPC handshake forgery, rxkad checksum
 formula) are necessarily identical to the upstream PoCs because they
 target the same kernel interfaces.
 
+## Additional techniques from 0xdeadbeefnetwork/Copy_Fail2-Electric_Boogaloo
+
+The following DIRTYFAIL features draw on techniques first published by
+[0xdeadbeefnetwork](https://github.com/0xdeadbeefnetwork/Copy_Fail2-Electric_Boogaloo):
+
+- `src/copyfail_gcm.c` — `rfc4106(gcm(aes))` AEAD in xfrm-ESP, using
+  AES-GCM keystream brute-force to land a single byte at an arbitrary
+  file offset. Reimplemented in DIRTYFAIL style using AF_ALG instead
+  of OpenSSL EVP, eliminating the `libssl-dev` runtime dependency.
+- `src/dirtyfrag_esp6.c` — IPv6 dual of xfrm-ESP. cf2 demonstrated the
+  esp6 size-gate workaround (≥48-byte frame); we reproduce that with
+  an 8-byte vmsplice'd pad.
+- `src/apparmor_bypass.c` — the `change_onexec(crun)` →
+  `change_onexec(chrome)` → unshare re-exec dance to escape Ubuntu's
+  unprivileged-userns AppArmor restriction. cf2 credits the technique
+  to Brad Spengler (grsecurity); we expose it as a `--aa-bypass` flag
+  and auto-arm it when a restrictive profile is detected.
+- `src/backdoor.c` — length-matched overwrite of a `nologin` line in
+  /etc/passwd with `sick::0:0:<pad>:/:/bin/bash`. cf2 publishes the
+  shell-script harness; DIRTYFAIL ports it into a single C function
+  driving our 1-byte primitive.
+
 See [README §11 — Credits](README.md#11-credits) for the full list.
