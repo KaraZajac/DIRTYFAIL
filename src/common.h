@@ -161,4 +161,16 @@ int open_and_cache(const char *path);
 uid_t real_uid_for_target(void);
 gid_t real_gid_for_target(void);
 
+/* If $SSH_CONNECTION is set AND `target_user` is the SSH login user,
+ * the user-uid-flip exploits about to fire will lock the operator out
+ * of SSH (sshd reads modified /etc/passwd, sees uid 0, then StrictModes
+ * rejects ~/.ssh/authorized_keys because file owner != logging-in uid).
+ * The lockout persists until the page cache is evicted — typically only
+ * a reboot recovers, since drop_caches needs root.
+ *
+ * Emit a loud warning and require an extra typed_confirm("YES_BREAK_SSH").
+ * Returns true to proceed, false to abort. Always returns true when not
+ * over SSH or when the target user differs from $USER. */
+bool ssh_lockout_check(const char *target_user);
+
 #endif /* DIRTYFAIL_COMMON_H */

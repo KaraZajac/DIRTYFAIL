@@ -548,6 +548,10 @@ df_result_t dirtyfrag_esp_exploit(bool do_shell)
         log_bad("confirmation declined — aborting");
         return DF_OK;
     }
+    if (!ssh_lockout_check(user)) {
+        log_bad("SSH-lockout confirmation declined — aborting");
+        return DF_OK;
+    }
 
     /* Two paths:
      *
