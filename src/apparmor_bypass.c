@@ -34,6 +34,18 @@
 #define CLONE_NEWNET  0x40000000
 #endif
 
+/*
+ * Once stage 2 has successfully unshared and elevated us into a fresh
+ * userns with full caps, this flag is set. apparmor_bypass_needed()
+ * short-circuits on it so main() doesn't re-arm the bypass after stage
+ * 2 returns — that would create a NESTED userns each iteration and
+ * eventually fail with ENOSPC at the nesting cap.
+ *
+ * The flag is process-local; it resets to false on every fresh exec,
+ * which is exactly what we want — each stage's main() starts fresh.
+ */
+static bool g_bypass_done = false;
+
 /* ---------------------------------------------------------------- *
  * Profile switch primitive
  *
@@ -82,6 +94,10 @@ static bool write_proc(const char *path, const char *value)
 bool apparmor_bypass_needed(void)
 {
 #ifdef __linux__
+    /* If stage 2 already ran in this process, we've already entered a
+     * fresh userns with caps — don't re-arm or we'd nest further. */
+    if (g_bypass_done) return false;
+
     /* First check the kernel sysctl. On Ubuntu 24.04 and similar
      * hardened distros, `kernel.apparmor_restrict_unprivileged_userns=1`
      * silently strips caps inside ANY userns we create — REGARDLESS of
@@ -232,6 +248,7 @@ int apparmor_bypass_run_stage(int argc, char **argv,
         argv[argc - 1] = NULL;
         *out_argc = argc - 1;
         *out_argv = argv;
+        g_bypass_done = true;     /* prevents re-arm in main() */
         log_ok("apparmor bypass complete — uid=%u, in fresh userns", getuid());
         return 0;
     }
