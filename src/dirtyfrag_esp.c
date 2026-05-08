@@ -87,18 +87,19 @@
 #ifdef __linux__
 #include <sys/syscall.h>
 #include <netinet/in.h>
-#include <netinet/udp.h>
 #include <arpa/inet.h>
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/xfrm.h>
-#include <linux/udp.h>
 #include <linux/if.h>
 #include <sys/ioctl.h>
 #endif
 
-/* Some of these are in <linux/udp.h> on modern Linux but missing on
- * macOS / older glibc — provide fallbacks so this compiles everywhere. */
+/* UDP_ENCAP / UDP_ENCAP_ESPINUDP live in <linux/udp.h>, but that header
+ * conflicts with <netinet/udp.h> over `struct udphdr` and we don't
+ * actually need the struct. The kernel constants are stable, so we
+ * just hard-code them as fallbacks (the #ifndef makes this a no-op if
+ * the toolchain happens to expose them already). */
 #ifndef UDP_ENCAP
 #define UDP_ENCAP             100
 #endif
