@@ -12,10 +12,11 @@ and may need re-verification as the kernel evolves.
 
 ### TL;DR
 
-Five kernel paths beyond the published CVEs were audited for the same
-in-place-AEAD-over-splice-pinned-pages bug class. **All five are
-structurally immune.** Two additional candidates (WireGuard and
-algif_skcipher) are flagged as open follow-up — see §1.5.
+Seven kernel paths beyond the published CVEs were audited for the
+same in-place-AEAD-over-splice-pinned-pages bug class. **All seven
+are structurally immune.** Three additional candidates (espintcp,
+OpenVPN kernel offload, SCTP-AUTH) remain as future follow-up —
+see §1.5.
 
 ### The vulnerable pattern
 
@@ -52,6 +53,8 @@ primitives that share the in-place destination scatterlist pattern.
 | **macsec_decrypt** | ✅ | **UNCONDITIONAL** | no — rx skbs come from netdev | NOT vulnerable — structurally immune |
 | **tls_sw recv decrypt** | ✅ | unconditional, also rx-only | no — rx skbs come from TCP rx ring | NOT vulnerable |
 | **tls_sw send encrypt + MSG_SPLICE_PAGES** | YES (read-only on user pages) | n/a (msg_en allocated separately) | yes (msg_pl) but only as src | NOT vulnerable — separate src/dst |
+| **WireGuard `decrypt_packet`** | ✅ ChaCha20Poly1305 in-place | **UNCONDITIONAL** at line 252 | yes via UDP rx (but COW protects) | NOT vulnerable — structurally immune |
+| **algif_skcipher `_skcipher_recvmsg`** | ✅ symmetric in-place possible | n/a (different module structure) | src yes (TX SGL), dst no (recv iovec) | NOT vulnerable — separate src/dst |
 
 ### §1.2 Eliminated paths — why each is immune
 
@@ -129,6 +132,69 @@ sg_chain(sg_aead_out, ..., msg_en);   /* kernel private pages  */
 aead_request_set_crypt(req, sg_aead_in, sg_aead_out, ...);
 ```
 
+### §1.3a WireGuard receive — `decrypt_packet()`
+
+ChaCha20Poly1305 in-place AEAD on incoming UDP skbs. Confirmed
+**not vulnerable** — `drivers/net/wireguard/receive.c:232–277`:
+
+```c
+static bool decrypt_packet(struct sk_buff *skb, struct noise_keypair *keypair)
+{
+    struct scatterlist sg[MAX_SKB_FRAGS + 8];
+    /* ... */
+    offset = -skb_network_offset(skb);
+    skb_push(skb, offset);
+    num_frags = skb_cow_data(skb, 0, &trailer);    /* line 252, UNCONDITIONAL */
+    /* ... */
+    sg_init_table(sg, num_frags);
+    if (skb_to_sgvec(skb, sg, 0, skb->len) <= 0)
+        return false;
+    if (!chacha20poly1305_decrypt_sg_inplace(sg, skb->len, NULL, 0,
+                                             PACKET_CB(skb)->nonce,
+                                             keypair->receiving.key))
+        return false;
+```
+
+`skb_cow_data` at line 252 is UNCONDITIONAL — no skip-cow branch. By
+the time the in-place AEAD runs, any splice-pinned pages have already
+been copied into kernel-private pages. Same defensive pattern as
+AH, MACsec, kTLS rx.
+
+### §1.3b algif_skcipher — `_skcipher_recvmsg()`
+
+The companion module to algif_aead, exposing symmetric ciphers
+(AES-CBC, AES-CTR, etc.) over AF_ALG. Same author and patchset era
+as the in-place optimization that introduced Copy Fail (2017,
+72548b093ee3); the Copy Fail upstream fix only reverted algif_aead,
+so worth verifying algif_skcipher independently.
+
+`crypto/algif_skcipher.c:151–152`:
+
+```c
+skcipher_request_set_crypt(&areq->cra_u.skcipher_req, areq->tsgl,
+                           areq->first_rsgl.sgl.sgt.sgl, len, ctx->iv);
+```
+
+- `areq->tsgl` = TX SGL, populated via `af_alg_pull_tsgl()`. CAN
+  contain user-spliced page-cache pages (sendmsg + splice path).
+- `areq->first_rsgl.sgl.sgt.sgl` = RX SGL, populated via
+  `af_alg_get_rsgl(sk, msg, ...)` from the user's `recv()` iovec,
+  via `iov_iter_get_pages` mapping the calling process's anonymous
+  memory.
+
+The cipher operation reads from `tsgl` (potentially user-spliced
+page-cache pages) and writes to `rsgl` (user's recv buffer in their
+own anonymous memory). **src ≠ dst; output never lands on
+splice-pinned page-cache pages.**
+
+Why this differs from algif_aead's Copy Fail: the algif_aead bug was
+specifically about the `authencesn` template internally chaining TAG
+pages into the destination SGL extension (`req->dst` extends past
+the end of `req->src`'s last page into chained tag pages, which
+happen to be the source's spliced pages). Plain skcipher has no AEAD
+tags, no chained scratch — clean src/dst separation. **Not
+vulnerable.**
+
 ### §1.4 The protective patterns that distinguish safe from vulnerable
 
 Every safe path on the list achieves immunity through one of three
@@ -147,24 +213,6 @@ mechanisms, each of which removes one of the four required conditions:
 
 These are kernel paths that *might* match the bug class but haven't
 been fully read yet. Listed in priority order.
-
-**HIGH — WireGuard (`drivers/net/wireguard/receive.c`)**
-ChaCha20Poly1305 in-place AEAD on incoming UDP skbs. WireGuard is
-widespread (kernel-resident since 5.6) and processes skbs that may
-carry frags from various sources. The question: does
-`wg_packet_decrypt_worker()` (or its scatterlist-building helper)
-call `skb_cow_data()` unconditionally before the AEAD, or does it
-have a skip-cow branch like esp_input? **Best single candidate**;
-structurally most similar to ESP among unaudited paths.
-
-**HIGH — `algif_skcipher` (`crypto/algif_skcipher.c`)**
-Same author and patchset era as the algif_aead in-place
-optimization that introduced Copy Fail (2017, commit 72548b093ee3).
-The Copy Fail upstream fix only reverted `algif_aead`; if
-`algif_skcipher` shares the splice-into-dst-SGL pattern,
-there's potentially an undisclosed CVE in the same module family.
-Worth a careful read of `_skcipher_recvmsg()` and the AF_ALG
-operation socket setup.
 
 **MEDIUM — `espintcp` (`net/xfrm/espintcp.c`)**
 IPsec ESP carried over TCP rather than UDP. Different transport,
