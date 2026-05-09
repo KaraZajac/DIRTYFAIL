@@ -196,10 +196,17 @@ df_result_t dirtyfrag_rxrpc_detect(void)
         return DF_PRECOND_FAIL;
     }
 
+    /* The RxRPC trigger needs to register an rxrpc key + open AF_RXRPC
+     * socket inside a userns with caps. If caps are stripped, fail out. */
+    if (apparmor_userns_caps_blocked()) {
+        log_ok("LSM-mitigated — unprivileged userns has no caps, RxRPC trigger "
+               "cannot register session keys or open AF_RXRPC.");
+        return DF_PRECOND_FAIL;
+    }
+
     log_warn("VULNERABLE — RxRPC variant of Dirty Frag is reachable");
-    log_warn("apply mitigation (blacklist rxrpc) until a patch lands:");
-    log_warn("  echo 'install rxrpc /bin/false' | sudo tee /etc/modprobe.d/dirtyfrag.conf");
-    log_warn("  sudo rmmod rxrpc 2>/dev/null; sudo sysctl vm.drop_caches=3");
+    log_warn("apply mitigation: `dirtyfail --mitigate` (blacklists rxrpc + others)");
+    log_warn("or manually: blacklist rxrpc + drop_caches");
     return DF_VULNERABLE;
 }
 

@@ -178,10 +178,24 @@ df_result_t dirtyfrag_esp_detect(void)
                  "on first SA registration. We treat this as still vulnerable.");
     }
 
+    /* On hardened distros (Ubuntu 26.04+) caps are stripped inside the
+     * userns even after our bypass — kernel may still have the bug but
+     * unprivileged users can't reach it. Report that honestly rather
+     * than claiming VULNERABLE. */
+    if (apparmor_userns_caps_blocked()) {
+        log_ok("LSM-mitigated — kernel may still have the bug but the AppArmor "
+               "policy denies CAP_NET_ADMIN inside any unprivileged userns.");
+        log_hint("unprivileged exploitation is blocked; real root can still "
+                 "reach the kernel bug. Apply the kernel patch as soon as your "
+                 "distro ships it.");
+        return DF_PRECOND_FAIL;
+    }
+
     log_warn("VULNERABLE (preconditions met) — userns + xfrm SA registration "
              "available, kernel within affected window");
     log_warn("apply mainline patch f4c50a4034e6 or your distro's backport");
-    log_warn("interim mitigation: blacklist esp4/esp6 in /etc/modprobe.d/");
+    log_warn("interim mitigation: `dirtyfail --mitigate` or manually blacklist "
+             "esp4/esp6 in /etc/modprobe.d/");
     return DF_VULNERABLE;
 }
 

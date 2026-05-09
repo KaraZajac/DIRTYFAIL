@@ -98,6 +98,12 @@ df_result_t copyfail_gcm_detect(void)
         return DF_PRECOND_FAIL;
     }
 
+    if (apparmor_userns_caps_blocked()) {
+        log_ok("LSM-mitigated — unprivileged userns lacks caps; xfrm SA install "
+               "via `ip xfrm` requires CAP_NET_ADMIN that the AA policy denies.");
+        return DF_PRECOND_FAIL;
+    }
+
     log_warn("VULNERABLE — GCM-variant of xfrm-ESP page-cache write reachable");
     log_warn("apply mainline patch f4c50a4034e6 or distro backport");
     return DF_VULNERABLE;

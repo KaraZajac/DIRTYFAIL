@@ -101,6 +101,12 @@ df_result_t dirtyfrag_esp6_detect(void)
     }
     close(s);
 
+    if (apparmor_userns_caps_blocked()) {
+        log_ok("LSM-mitigated — same hardening that blocks v4 also blocks v6 "
+               "(unprivileged userns has no caps).");
+        return DF_PRECOND_FAIL;
+    }
+
     log_warn("VULNERABLE (preconditions met) — v6 xfrm SA registration available");
     log_warn("Apply mainline patch f4c50a4034e6 (covers both v4 and v6)");
     log_warn("Some distro backports may have shipped v4-only — test both paths");

@@ -64,6 +64,23 @@ bool apparmor_bypass_needed(void);
  * before deciding whether to fork+unshare on their own. */
 bool apparmor_bypass_was_armed(void);
 
+/* Probe whether the bypass actually grants caps on this kernel.
+ * Forks a child that does unshare(USER) and tries to write to
+ * /proc/self/setgroups; if that fails with EPERM, we're on a kernel
+ * (Ubuntu 26.04+) that auto-transitions to the unprivileged_userns
+ * sub-profile and denies caps regardless of bypass technique.
+ *
+ * Returns true if unprivileged userns is COMPREHENSIVELY blocked
+ * (the bug class is unreachable for unprivileged users). Returns
+ * false if userns operations work normally OR if AA isn't loaded
+ * at all (in which case `apparmor_bypass_needed()` would also
+ * return false).
+ *
+ * This is the right signal for `--scan` to report "VULNERABLE in
+ * kernel but LSM-mitigated" vs plain "VULNERABLE".
+ */
+bool apparmor_userns_caps_blocked(void);
+
 /* Fork a child that arms the AA bypass and re-execs itself through
  * the stages. The child eventually lands inside a fresh user/net
  * namespace with full caps; main() in that re-exec'd image dispatches

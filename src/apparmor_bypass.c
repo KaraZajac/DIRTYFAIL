@@ -48,6 +48,43 @@ static bool g_bypass_done = false;
 
 bool apparmor_bypass_was_armed(void) { return g_bypass_done; }
 
+bool apparmor_userns_caps_blocked(void)
+{
+#ifdef __linux__
+    /* Quick check: if the AA sysctl isn't there or is 0, no blocking. */
+    int fd = open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+                  O_RDONLY);
+    if (fd < 0) return false;   /* no AA hardening sysctl */
+    char b[8] = {0};
+    ssize_t n = read(fd, b, sizeof(b) - 1);
+    close(fd);
+    if (n <= 0 || b[0] != '1') return false;
+
+    /* Sysctl says hardened. Confirm by forking a child that
+     * unshares(USER) and tries to write to /proc/self/setgroups —
+     * a CAP_SYS_ADMIN-gated operation that would succeed inside a
+     * fresh userns IFF caps survived the transition. On 26.04-style
+     * hardening the auto-transition to unprivileged_userns sub-
+     * profile denies the cap, write fails with EPERM. */
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        if (syscall(SYS_unshare, CLONE_NEWUSER) != 0) _exit(1);
+        int wfd = open("/proc/self/setgroups", O_WRONLY);
+        if (wfd < 0) _exit(2);          /* EPERM here = blocked */
+        ssize_t w = write(wfd, "deny", 4);
+        close(wfd);
+        _exit(w == 4 ? 0 : 3);          /* 0 = caps work, 3 = blocked */
+    }
+    int wstat = 0;
+    waitpid(pid, &wstat, 0);
+    /* Caps work if child exited 0; any non-zero means blocked or error. */
+    return !(WIFEXITED(wstat) && WEXITSTATUS(wstat) == 0);
+#else
+    return false;
+#endif
+}
+
 /* ---------------------------------------------------------------- *
  * Profile switch primitive
  *

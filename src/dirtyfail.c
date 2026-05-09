@@ -30,6 +30,7 @@
 #include "dirtyfrag_rxrpc.h"
 #include "apparmor_bypass.h"
 #include "backdoor.h"
+#include "mitigate.h"
 
 #include <getopt.h>
 #include <fcntl.h>
@@ -70,6 +71,10 @@ static void usage(const char *prog)
 "                         until page eviction. Use --cleanup-backdoor to revert.\n"
 "  --cleanup              evict /etc/passwd from page cache and drop_caches\n"
 "  --cleanup-backdoor     restore /etc/passwd line from /var/tmp/.dirtyfail.state\n"
+"  --mitigate             DEFENSIVE: blacklist algif_aead/esp4/esp6/rxrpc,\n"
+"                         set apparmor_restrict_unprivileged_userns=1.\n"
+"                         Requires root. Side-effect: breaks IPsec/AFS.\n"
+"  --cleanup-mitigate     remove the modprobe/sysctl mitigation files\n"
 "  --version              print version\n"
 "  --help                 this message\n"
 "\n"
@@ -105,6 +110,8 @@ enum mode {
     MODE_EXPLOIT_BACKDOOR,
     MODE_CLEANUP,
     MODE_CLEANUP_BACKDOOR,
+    MODE_MITIGATE,
+    MODE_CLEANUP_MITIGATE,
     MODE_HELP,
     MODE_VERSION,
 };
@@ -166,6 +173,8 @@ int main(int argc, char **argv)
         {"exploit-backdoor",  no_argument, NULL, 13 },
         {"cleanup",           no_argument, NULL,  6 },
         {"cleanup-backdoor",  no_argument, NULL, 14 },
+        {"mitigate",          no_argument, NULL, 15 },
+        {"cleanup-mitigate",  no_argument, NULL, 16 },
         {"no-shell",         no_argument, NULL, 'n'},
         {"no-color",         no_argument, NULL, 'C'},
         {"aa-bypass",        no_argument, NULL,  8 },
@@ -191,6 +200,8 @@ int main(int argc, char **argv)
             case 12 :  m = MODE_EXPLOIT_GCM;      break;
             case 13 :  m = MODE_EXPLOIT_BACKDOOR; break;
             case 14 :  m = MODE_CLEANUP_BACKDOOR; break;
+            case 15 :  m = MODE_MITIGATE;         break;
+            case 16 :  m = MODE_CLEANUP_MITIGATE; break;
             case 'n':  do_shell = false;          break;
             case 'C':  dirtyfail_use_color = false; break;
             case  8 :  aa_bypass = true;          break;
@@ -299,6 +310,14 @@ int main(int argc, char **argv)
 
     case MODE_CLEANUP_BACKDOOR:
         r = backdoor_cleanup();
+        break;
+
+    case MODE_MITIGATE:
+        r = mitigate_apply();
+        break;
+
+    case MODE_CLEANUP_MITIGATE:
+        r = mitigate_revert();
         break;
 
     case MODE_CLEANUP:
