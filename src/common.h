@@ -81,6 +81,11 @@ extern bool dirtyfail_active_probes;
  * boundaries. Set by --no-revert. */
 extern bool dirtyfail_no_revert;
 
+/* When true, --scan emits a single JSON object on stdout (suitable for
+ * SIEM/fleet ingestion); all log output (banner, step/ok/bad/warn/hint)
+ * is redirected to stderr. Set by --json. */
+extern bool dirtyfail_json;
+
 void log_step (const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void log_ok   (const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void log_bad  (const char *fmt, ...) __attribute__((format(printf, 1, 2)));

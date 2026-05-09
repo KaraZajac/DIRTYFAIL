@@ -30,6 +30,7 @@
 bool dirtyfail_use_color    = true;
 bool dirtyfail_active_probes = false;
 bool dirtyfail_no_revert    = false;
+bool dirtyfail_json         = false;
 
 static void vlog(FILE *out, const char *prefix, const char *color,
                  const char *fmt, va_list ap)
@@ -47,10 +48,15 @@ static void vlog(FILE *out, const char *prefix, const char *color,
     fflush(out);
 }
 
-#define LOG_FN(name, prefix, color, stream)                                 \
+/* In --json mode, all log output goes to stderr so stdout stays a
+ * clean JSON document for downstream parsers. Outside --json mode,
+ * we keep the original split (info/progress to stdout, errors to
+ * stderr) for human readability. */
+#define LOG_FN(name, prefix, color, default_stream)                         \
     void name(const char *fmt, ...) {                                       \
+        FILE *_s = dirtyfail_json ? stderr : (default_stream);              \
         va_list ap; va_start(ap, fmt);                                      \
-        vlog(stream, prefix, color, fmt, ap);                               \
+        vlog(_s, prefix, color, fmt, ap);                                   \
         va_end(ap);                                                         \
     }
 

@@ -202,6 +202,7 @@ SCAN this host:
   curl ... | bash                     # bash check (no compile)
   ./dirtyfail --scan                  # preconds + Copy Fail probe (~1s)
   ./dirtyfail --scan --active         # all 5 sentinel-STORE probes (~10s)
+  ./dirtyfail --scan --active --json  # same, machine-readable for SIEM
 
 MITIGATE (Ubuntu / fleet-wide):
   sudo ./dirtyfail --mitigate         # one-shot defensive deployment

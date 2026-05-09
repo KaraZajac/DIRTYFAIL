@@ -62,13 +62,13 @@ distros and kernel versions. The matrix below reflects per-mode test
 results from running each `--exploit-*` mode against a fresh install
 of each distro.
 
-| Distro | Kernel | LSM | Copy Fail | xfrm-ESP v4 | xfrm-ESP v6 | RxRPC | GCM | Backdoor |
-|---|---|---|:-:|:-:|:-:|:-:|:-:|:-:|
-| Ubuntu 24.04 LTS | `6.8.0-111-generic` | AppArmor | 🛡²  | ✅ | ✅ | ✅ | ✅¹ | ✅¹ |
-| Debian 13.4 | `6.12.86+deb13` | none | 🛡 | 🛡 | 🛡 | 🛡 | 🛡 | 🛡 |
-| AlmaLinux 10.1 | `6.12.0-124.8.1.el10_1` | SELinux | ✅ | ✅ | ✅ | ⏭³ | ✅ | ✅ |
-| Fedora 44 (Server) | `6.19.10-300.fc44` | SELinux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Ubuntu 26.04 LTS | `7.0.0-15-generic` | AppArmor (hardened) | 🛡 | 🛡⁴ | 🛡⁴ | 🛡⁴ | 🛡⁴ | 🛡⁴ |
+| Distro | Kernel | LSM | Copy Fail | xfrm-ESP v4 | xfrm-ESP v6 | RxRPC | GCM | Backdoor | SU shellcode |
+|---|---|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
+| Ubuntu 24.04 LTS | `6.8.0-111-generic` | AppArmor | 🛡²  | ✅ | ✅ | ✅ | ✅¹ | ✅¹ | (not tested) |
+| Debian 13.4 | `6.12.86+deb13` | none | 🛡 | 🛡 | 🛡 | 🛡 | 🛡 | 🛡 | 🛡⁵ |
+| AlmaLinux 10.1 | `6.12.0-124.8.1.el10_1` | SELinux | ✅ | ✅ | ✅ | ⏭³ | ✅ | ✅ | ✅ |
+| Fedora 44 (Server) | `6.19.10-300.fc44` | SELinux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Ubuntu 26.04 LTS | `7.0.0-15-generic` | AppArmor (hardened) | 🛡 | 🛡⁴ | 🛡⁴ | 🛡⁴ | 🛡⁴ | 🛡⁴ | 🛡⁵ |
 
 **Legend:** ✅ exploit landed and produced real init-ns root  · 🛡 mitigated — exploit cannot reach kernel bug (kernel patched OR LSM blocks unprivileged path)  · ⏭ not applicable (precondition missing)
 
@@ -141,6 +141,17 @@ technique. We tested `change_onexec(crun)`, `change_onexec(chrome)`,
 mitigated for unprivileged users without requiring a kernel rebuild.
 A subsequent stable update will likely also bring the kernel patch
 proper, completing the defense.
+
+⁵ **`--exploit-su` shellcode injection** depends on the same Copy Fail
+algif_aead 4-byte primitive (`cf_4byte_write`). On kernels where
+Copy Fail is patched (Debian 13.4) or LSM-blocked (Ubuntu 26.04 — but
+the algif_aead path was also patched in 7.0.0-15), the plant runs
+through but the verify step fails ("page cache does not match planted
+shellcode") and the auto-revert restores `/usr/bin/su`. Tested
+end-to-end on AlmaLinux 10.1 (entry point at file offset `0x45b0`)
+and Fedora 44 (offset `0x1b60`); ELF parser handles each distro's
+PIE base independently. Real-root proof on Fedora 44:
+`uid=0(root) gid=0(root) ... context=unconfined_u:unconfined_r:unconfined_t`.
 
 Test reproducibility:
 

@@ -35,6 +35,7 @@
 
 #include <getopt.h>
 #include <fcntl.h>
+#include <sys/utsname.h>
 
 static const char BANNER[] =
 "\n"
@@ -96,6 +97,10 @@ static void usage(const char *prog)
 "  --no-revert            with --no-shell, also skip the auto-revert\n"
 "                         (leaves the page cache poisoned — used by\n"
 "                         tools/dirtyfail-container-escape.sh demo)\n"
+"  --json                 emit a single JSON object on stdout (--scan\n"
+"                         only); all log output redirected to stderr.\n"
+"                         Suitable for SIEM/fleet scanning. Implies\n"
+"                         --no-color and suppresses the banner.\n"
 "  --no-color             disable ANSI color in output\n"
 "  --aa-bypass            force the AppArmor unprivileged-userns bypass\n"
 "                         (auto-armed when restricted profile is detected)\n"
@@ -137,6 +142,17 @@ enum mode {
 
 int main(int argc, char **argv)
 {
+    /* Pick up flags that need to survive AA-bypass fork+re-exec via env.
+     * The child re-execs with its own argv (stage tags only), so flags
+     * set in the parent's argv don't reach the child unless we propagate
+     * them through env vars. --json is the main case: without this, the
+     * child's log_* output goes to stdout and corrupts the JSON document
+     * the parent is building. */
+    if (getenv("DIRTYFAIL_JSON")) {
+        dirtyfail_json     = true;
+        dirtyfail_use_color = false;
+    }
+
     /* If we're a re-exec from the apparmor bypass dance, route to the
      * stage handler immediately. Stage 1 re-execs to stage 2; stage 2
      * unshares + raises caps, then either:
@@ -200,6 +216,7 @@ int main(int argc, char **argv)
         {"exploit-su",        no_argument, NULL, 18 },
         {"cleanup-su",        no_argument, NULL, 19 },
         {"no-revert",         no_argument, NULL, 20 },
+        {"json",              no_argument, NULL, 21 },
         {"no-shell",         no_argument, NULL, 'n'},
         {"no-color",         no_argument, NULL, 'C'},
         {"aa-bypass",        no_argument, NULL,  8 },
@@ -231,6 +248,11 @@ int main(int argc, char **argv)
             case 18 :  m = MODE_EXPLOIT_SU;       break;
             case 19 :  m = MODE_CLEANUP_SU;       break;
             case 20 :  dirtyfail_no_revert = true; break;
+            case 21 :  dirtyfail_json = true;
+                       dirtyfail_use_color = false;
+                       /* Propagate through fork+re-exec for AA bypass children */
+                       setenv("DIRTYFAIL_JSON", "1", 1);
+                       break;
             case 'n':  do_shell = false;          break;
             case 'C':  dirtyfail_use_color = false; break;
             case  8 :  aa_bypass = true;          break;
@@ -259,10 +281,12 @@ int main(int argc, char **argv)
         }
     }
 
-    if (dirtyfail_use_color) fputs("\033[1;35m", stdout);
-    fputs(BANNER, stdout);
-    if (dirtyfail_use_color) fputs("\033[0m", stdout);
-    fputc('\n', stdout);
+    if (!dirtyfail_json) {
+        if (dirtyfail_use_color) fputs("\033[1;35m", stdout);
+        fputs(BANNER, stdout);
+        if (dirtyfail_use_color) fputs("\033[0m", stdout);
+        fputc('\n', stdout);
+    }
 
     df_result_t r = DF_OK;
 
@@ -270,11 +294,11 @@ int main(int argc, char **argv)
     case MODE_SCAN: {
         log_step("running full scan — five detectors\n");
 
-        df_result_t a  = copyfail_detect();         fputc('\n', stdout);
-        df_result_t b  = dirtyfrag_esp_detect();    fputc('\n', stdout);
-        df_result_t b6 = dirtyfrag_esp6_detect();   fputc('\n', stdout);
-        df_result_t c2 = dirtyfrag_rxrpc_detect();  fputc('\n', stdout);
-        df_result_t g  = copyfail_gcm_detect();     fputc('\n', stdout);
+        df_result_t a  = copyfail_detect();         if (!dirtyfail_json) fputc('\n', stdout);
+        df_result_t b  = dirtyfrag_esp_detect();    if (!dirtyfail_json) fputc('\n', stdout);
+        df_result_t b6 = dirtyfrag_esp6_detect();   if (!dirtyfail_json) fputc('\n', stdout);
+        df_result_t c2 = dirtyfrag_rxrpc_detect();  if (!dirtyfail_json) fputc('\n', stdout);
+        df_result_t g  = copyfail_gcm_detect();     if (!dirtyfail_json) fputc('\n', stdout);
 
         const char *label[] = {
             [DF_OK]            = "not vulnerable",
@@ -282,13 +306,21 @@ int main(int argc, char **argv)
             [DF_VULNERABLE]    = "VULNERABLE",
             [DF_PRECOND_FAIL]  = "preconditions missing",
         };
+        const char *json_label[] = {
+            [DF_OK]            = "not_vulnerable",
+            [DF_TEST_ERROR]    = "test_error",
+            [DF_VULNERABLE]    = "vulnerable",
+            [DF_PRECOND_FAIL]  = "preconds_missing",
+        };
 
-        log_step("scan summary:");
-        log_hint("  Copy Fail (algif_aead, CVE-2026-31431):     %s", label[a  & 7]);
-        log_hint("  Dirty Frag ESP v4 (CVE-2026-43284):         %s", label[b  & 7]);
-        log_hint("  Dirty Frag ESP v6 (CVE-2026-43284 v6):      %s", label[b6 & 7]);
-        log_hint("  Dirty Frag RxRPC  (CVE-2026-43500):         %s", label[c2 & 7]);
-        log_hint("  Copy Fail GCM variant (xfrm rfc4106):       %s", label[g  & 7]);
+        if (!dirtyfail_json) {
+            log_step("scan summary:");
+            log_hint("  Copy Fail (algif_aead, CVE-2026-31431):     %s", label[a  & 7]);
+            log_hint("  Dirty Frag ESP v4 (CVE-2026-43284):         %s", label[b  & 7]);
+            log_hint("  Dirty Frag ESP v6 (CVE-2026-43284 v6):      %s", label[b6 & 7]);
+            log_hint("  Dirty Frag RxRPC  (CVE-2026-43500):         %s", label[c2 & 7]);
+            log_hint("  Copy Fail GCM variant (xfrm rfc4106):       %s", label[g  & 7]);
+        }
 
         if (a == DF_VULNERABLE || b == DF_VULNERABLE || b6 == DF_VULNERABLE ||
             c2 == DF_VULNERABLE || g == DF_VULNERABLE)
@@ -298,6 +330,28 @@ int main(int argc, char **argv)
             r = DF_TEST_ERROR;
         else
             r = DF_OK;
+
+        if (dirtyfail_json) {
+            struct utsname u; uname(&u);
+            const char *summary = json_label[r & 7];
+            printf("{\n");
+            printf("  \"tool\": \"dirtyfail\",\n");
+            printf("  \"version\": \"" DIRTYFAIL_VERSION "\",\n");
+            printf("  \"hostname\": \"%s\",\n", u.nodename);
+            printf("  \"kernel\": \"%s\",\n",   u.release);
+            printf("  \"machine\": \"%s\",\n",  u.machine);
+            printf("  \"active_probes\": %s,\n",
+                   dirtyfail_active_probes ? "true" : "false");
+            printf("  \"results\": [\n");
+            printf("    {\"cve\": \"CVE-2026-31431\",     \"name\": \"copyfail\",        \"status\": \"%s\"},\n", json_label[a  & 7]);
+            printf("    {\"cve\": \"CVE-2026-43284\",     \"name\": \"dirtyfrag-esp\",   \"status\": \"%s\"},\n", json_label[b  & 7]);
+            printf("    {\"cve\": \"CVE-2026-43284-v6\",  \"name\": \"dirtyfrag-esp6\",  \"status\": \"%s\"},\n", json_label[b6 & 7]);
+            printf("    {\"cve\": \"CVE-2026-43500\",     \"name\": \"dirtyfrag-rxrpc\", \"status\": \"%s\"},\n", json_label[c2 & 7]);
+            printf("    {\"cve\": \"CVE-2026-31431-gcm\", \"name\": \"copyfail-gcm\",    \"status\": \"%s\"}\n",  json_label[g  & 7]);
+            printf("  ],\n");
+            printf("  \"summary\": \"%s\"\n", summary);
+            printf("}\n");
+        }
         break;
     }
 
