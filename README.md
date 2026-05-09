@@ -28,6 +28,16 @@ vulnerable system.
 
 **Bonus modes:**
 
+- **`--scan --active`** — sentinel-STORE active probes. Default `--scan`
+  reports per-CVE preconditions (kernel, modules, LSM state) plus an
+  active probe of the Copy Fail primitive. Adding `--active` extends
+  the sentinel-file STORE probe to all four other primitives (ESP v4,
+  ESP v6, RxRPC, GCM): each fires the kernel trigger against a `/tmp`
+  sentinel and reports VULNERABLE only if the marker bytes actually
+  land. This is the only way to distinguish a backported-patched
+  kernel (preconds say vulnerable but probe says intact) from an
+  unpatched one without running the full exploit. `/etc/passwd` is
+  never touched. Auto-calibrates V6 STORE shift per kernel build.
 - **`--exploit-backdoor`** — persistent uid-0 backdoor: length-matched
   overwrite of a `nologin`/`false`/`sync` line in `/etc/passwd` with
   `dirtyfail::0:0:<pad>:/:/bin/bash`. Survives shell exit until page
@@ -61,6 +71,26 @@ of each distro.
 | Ubuntu 26.04 LTS | `7.0.0-15-generic` | AppArmor (hardened) | 🛡 | 🛡⁴ | 🛡⁴ | 🛡⁴ | 🛡⁴ | 🛡⁴ |
 
 **Legend:** ✅ exploit landed and produced real init-ns root  · 🛡 mitigated — exploit cannot reach kernel bug (kernel patched OR LSM blocks unprivileged path)  · ⏭ not applicable (precondition missing)
+
+### Active-probe validation (`--scan --active`)
+
+The `--active` flag adds a sentinel-file STORE probe per CVE during
+detection. We validated the probe outputs against the same 4 distros
+above (Debian, Fedora, AlmaLinux, Ubuntu 26.04) — the matrix below
+shows the per-mode probe verdict and matches the full-exploit
+ground-truth one-for-one:
+
+| Distro | Copy Fail probe | ESP v4 probe | ESP v6 probe | RxRPC probe | GCM probe |
+|---|:-:|:-:|:-:|:-:|:-:|
+| Debian 13.4 | intact 🛡 | intact 🛡 | intact 🛡 | intact 🛡 | intact 🛡 |
+| Fedora 44   | marker @0 ✅ | STORE @0 ✅ | STORE @8 ✅ | byte change ✅ | sentinel[0] 0x41→0x27 ✅ |
+| AlmaLinux 10.1 | marker @0 ✅ | STORE @0 ✅ | STORE @8 ✅ | preconds ⏭ | sentinel changed ✅ |
+| Ubuntu 26.04 | intact 🛡 | LSM-blocked 🛡 | LSM-blocked 🛡 | LSM-blocked 🛡 | LSM-blocked 🛡 |
+
+The V6 probe's STORE landing offset (8 on Fedora and Alma) matches the
+empirical `V6_STORE_SHIFT` that `calibrate_v6_shift()` discovers at
+runtime — confirming the auto-calibration replaces the previously
+hard-coded constant correctly across kernel builds.
 
 ¹ GCM and Backdoor require `algif_aead` to be loadable. Ubuntu 24.04
 ships `/etc/modprobe.d/disable-algif_aead.conf` blacklisting it as a
@@ -132,6 +162,7 @@ Test reproducibility:
 2. [CVE-2026-31431 — Copy Fail](#2-cve-2026-31431--copy-fail)
 3. [CVE-2026-43284 — Dirty Frag (xfrm-ESP)](#3-cve-2026-43284--dirty-frag-xfrm-esp)
 4. [CVE-2026-43500 — Dirty Frag (RxRPC)](#4-cve-2026-43500--dirty-frag-rxrpc)
+    - [4.5 Architecture overview](#45-architecture-overview)
 5. [Build](#5-build)
 6. [Usage](#6-usage)
 7. [How DIRTYFAIL detects each CVE](#7-how-dirtyfail-detects-each-cve)
@@ -404,6 +435,78 @@ shell because `pam_unix.so nullok` accepts an empty password.
 
 For comparison and verification against the upstream PoC, see
 V4bel's `exp.c`: <https://github.com/V4bel/dirtyfrag>.
+
+---
+
+## 4.5 Architecture overview
+
+DIRTYFAIL is a single C binary built from ~10 source modules. The
+high-level structure:
+
+```
+                     ┌─────────────────────────────────────────┐
+                     │            dirtyfail (CLI)              │
+                     │ src/dirtyfail.c — argv → mode dispatch  │
+                     └────────────────┬────────────────────────┘
+                                      │
+           ┌──────────────────┬───────┼───────┬─────────────────┬───────────┐
+           │                  │       │       │                 │           │
+           ▼                  ▼       ▼       ▼                 ▼           ▼
+    ┌──────────────┐  ┌─────────────────┐  ┌──────────────┐  ┌──────────┐  ┌────────────┐
+    │  --scan      │  │  --exploit-*    │  │  --backdoor  │  │--mitigate│  │ --cleanup* │
+    │  (detect.c)  │  │  (5 modes)      │  │  install +   │  │ defense  │  │ revert     │
+    │              │  │                 │  │  cleanup     │  │          │  │            │
+    └──────┬───────┘  └────────┬────────┘  └──────┬───────┘  └────┬─────┘  └────────────┘
+           │                   │                  │                │
+           │  ┌────────────────┼──────────────────┼────────────────┘
+           │  │                │                  │
+           ▼  ▼                ▼                  ▼
+    ┌──────────────┐  ┌──────────────────┐  ┌──────────────────┐
+    │ apparmor_    │  │  outer (init ns) │  │ cfg_1byte_write  │
+    │ bypass.c     │  │  → fork → child  │  │  (gcm primitive) │
+    │              │  │  outer/inner     │  │                  │
+    │ * sysctl     │  │  split           │  │  used by gcm +   │
+    │ * caps_blocked  │                  │  │  backdoor for    │
+    │ * fork_arm   │  │  parent stays    │  │  arbitrary-byte  │
+    └──────┬───────┘  │  in init ns,     │  │  writes          │
+           │          │  child re-execs  │  └────────┬─────────┘
+           │          │  via change_     │           │
+           ▼          │  onexec(crun) +  │           ▼
+    ┌──────────────┐  │  AA stage 1/2    │  ┌──────────────────┐
+    │ stage 1/2    │  │  unshare + caps  │  │ AF_ALG ecb(aes)  │
+    │ handler      │  │  → run inner     │  │ keystream brute  │
+    └──────────────┘  └──────────────────┘  │ force            │
+                                              └──────────────────┘
+
+  Per-CVE primitives (each has detect/exploit/exploit_inner functions):
+
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ copyfail.c        algif_aead authencesn 4-byte STORE  (CVE-2026-31431) │
+  │ copyfail_gcm.c    rfc4106(gcm(aes)) 1-byte STORE      (CVE-2026-43284) │
+  │ dirtyfrag_esp.c   xfrm-ESP IPv4 4-byte STORE          (CVE-2026-43284) │
+  │ dirtyfrag_esp6.c  xfrm-ESP IPv6 4-byte STORE w/ +9    (CVE-2026-43284) │
+  │ dirtyfrag_rxrpc.c rxkad 8-byte STORE + fcrypt brute   (CVE-2026-43500) │
+  │ fcrypt.c          rxkad cipher (56-bit Feistel)                        │
+  │ backdoor.c        persistent /etc/passwd line overwrite                │
+  └──────────────────────────────────────────────────────────────────────┘
+```
+
+**Key design decisions:**
+
+- **Outer/inner split**: every exploit forks a child for the kernel
+  work. Parent stays in init namespace so the eventual `execlp("su",
+  user)` reaches REAL init-ns root. See [§8.5
+  Architecture](#85-architecture-outerinner-fork-based-bypass).
+- **Page cache is global**: child writes from inside its bypass userns,
+  parent reads from init ns; same bytes visible.
+- **Env vars carry parent → child state**: `DIRTYFAIL_INNER_MODE`,
+  `DIRTYFAIL_TARGET_USER`, `DIRTYFAIL_K_{A,B,C}` (rxrpc),
+  `DIRTYFAIL_LINE_OFF` etc. (backdoor). `execv` preserves the
+  environment across stage transitions.
+- **Defensive companion**: `--mitigate` deploys the same blacklists +
+  sysctl hardening that distros ship as official mitigations.
+  `--scan` detects when caps are LSM-blocked and reports
+  "mitigated" rather than misleading "VULNERABLE preconditions met".
 
 ---
 

@@ -24,9 +24,47 @@ SOURCES := $(wildcard $(SRC_DIR)/*.c)
 OBJECTS := $(patsubst $(SRC_DIR)/%.c,$(BUILD)/%.o,$(SOURCES))
 BIN     := dirtyfail
 
-.PHONY: all debug static clean scan install
+.PHONY: all debug static clean scan install test test-fcrypt test-aes-ecb
 
 all: $(BIN)
+
+# === Tests ===========================================================
+#
+#   make test          build + run all primitive selftests
+#   make test-fcrypt   just fcrypt (cipher, brute force) — runs anywhere
+#   make test-aes-ecb  AF_ALG ecb(aes) round-trip — Linux only
+#
+# Tests live in tests/, build standalone executables that link the
+# minimum from src/. They don't pull in netlink / xfrm / rxrpc — those
+# require root or AA bypass to exercise meaningfully and are tested
+# end-to-end via `--exploit-* --no-shell` on a target host instead.
+
+TEST_DIR  := tests
+TEST_BUILD:= $(BUILD)/tests
+
+# fcrypt selftest needs only fcrypt + common (for log_*) — no Linux deps
+$(TEST_BUILD)/test_fcrypt: $(TEST_DIR)/test_fcrypt.c $(SRC_DIR)/fcrypt.c $(SRC_DIR)/common.c | $(TEST_BUILD)
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o $@ $^
+
+# AES-ECB AF_ALG round-trip — Linux only, no DIRTYFAIL src deps
+$(TEST_BUILD)/test_aes_ecb: $(TEST_DIR)/test_aes_ecb.c | $(TEST_BUILD)
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(TEST_BUILD): | $(BUILD)
+	@mkdir -p $(TEST_BUILD)
+
+test-fcrypt: $(TEST_BUILD)/test_fcrypt
+	@echo "=== test_fcrypt ==="
+	$<
+	@echo ""
+
+test-aes-ecb: $(TEST_BUILD)/test_aes_ecb
+	@echo "=== test_aes_ecb ==="
+	$<
+	@echo ""
+
+test: test-fcrypt test-aes-ecb
+	@echo "=== all primitive selftests passed ==="
 
 $(BIN): $(OBJECTS)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^

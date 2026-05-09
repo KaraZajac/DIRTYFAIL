@@ -28,4 +28,13 @@ df_result_t dirtyfrag_esp_exploit(bool do_shell);
  * the parent owns those. Exits with df_result_t cast to int. */
 df_result_t dirtyfrag_esp_exploit_inner(void);
 
+/* Active probe: fires the v4 ESP-in-UDP trigger against a /tmp sentinel
+ * file (never /etc/passwd) and reports whether the marker landed.
+ * Used by `--scan --active`. The inner half runs in the bypass userns
+ * and reads DIRTYFAIL_PROBE_SENTINEL for the target path. Returns
+ * DF_VULNERABLE on marker hit, DF_OK if patched, DF_PRECOND_FAIL on
+ * AA-block, DF_TEST_ERROR otherwise. */
+df_result_t dirtyfrag_esp_active_probe(void);
+df_result_t dirtyfrag_esp_active_probe_inner(void);
+
 #endif

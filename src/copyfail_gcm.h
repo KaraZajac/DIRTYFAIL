@@ -50,4 +50,12 @@ bool cfg_1byte_write(const char *target_path,
                      off_t target_off,
                      unsigned char desired_byte);
 
+/* Active probe: installs a GCM SA with arbitrary IV, fires ONE
+ * gcm_trigger against a /tmp sentinel. Skips IV brute force entirely;
+ * the kernel STORE writes an unpredictable byte (keystream XOR 'A')
+ * which still confirms the path is reachable. Returns DF_VULNERABLE
+ * on byte change, DF_OK if intact, DF_PRECOND_FAIL on AA-block. */
+df_result_t copyfail_gcm_active_probe(void);
+df_result_t copyfail_gcm_active_probe_inner(void);
+
 #endif

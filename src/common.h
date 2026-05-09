@@ -71,6 +71,10 @@ struct sockaddr_alg_compat {
  * ------------------------------------------------------------------ */
 extern bool dirtyfail_use_color;
 
+/* When true, --scan and --check-* modes do an active sentinel-file STORE
+ * probe per mode in addition to precondition checks. Set by --active. */
+extern bool dirtyfail_active_probes;
+
 void log_step (const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void log_ok   (const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void log_bad  (const char *fmt, ...) __attribute__((format(printf, 1, 2)));

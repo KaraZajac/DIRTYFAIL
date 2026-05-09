@@ -27,7 +27,8 @@
 #define CLONE_NEWUSER 0x10000000
 #endif
 
-bool dirtyfail_use_color = true;
+bool dirtyfail_use_color    = true;
+bool dirtyfail_active_probes = false;
 
 static void vlog(FILE *out, const char *prefix, const char *color,
                  const char *fmt, va_list ap)

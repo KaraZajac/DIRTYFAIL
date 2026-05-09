@@ -27,12 +27,17 @@ Exit code: `0` mitigated, `1` vulnerable, `2` couldn't determine.
 ```bash
 git clone https://github.com/KaraZajac/DIRTYFAIL.git
 cd DIRTYFAIL && make
-./dirtyfail --scan
+./dirtyfail --scan --active
 ```
 
-The `--scan` mode actively probes the Copy Fail primitive against a
-sentinel file in `/tmp` (no system files modified) and reports
-precondition state for the other four exploit modes.
+The default `--scan` mode runs precondition checks (kernel version,
+module presence, LSM state) plus an active probe of the Copy Fail
+primitive against a sentinel file in `/tmp`. Adding `--active` extends
+the sentinel-STORE probe to the other four primitives (ESP v4, ESP v6,
+RxRPC, GCM) — this is the only way to distinguish a backported-patched
+kernel from an unpatched one without running the full exploit. The
+probes only modify temporary files in `/tmp`; `/etc/passwd` is never
+touched.
 
 **Per-CVE breakdown (manual checks):**
 
@@ -137,23 +142,41 @@ For detection:
 
 ### auditd rules (universal)
 
-Drop in `/etc/audit/rules.d/99-dirtyfail.rules`:
+A ready-to-load rules file ships in `tools/99-dirtyfail.rules`. It
+covers six syscall paths used by the exploit chain: XFRM netlink,
+add_key(rxrpc), unshare(CLONE_NEWUSER), AF_ALG socket creation,
+AppArmor `change_onexec` writes, and direct `/etc/passwd`/`/etc/shadow`
+modifications.
 
-```
-# XFRM SA registration from non-root → exploit attempt signal
--a always,exit -F arch=b64 -S socket -F a0=16 -F a2=6 -F auid>=1000 -F auid!=4294967295 \
-   -k dirtyfail-xfrm
-
-# add_key() with rxrpc type → RxRPC exploit prep
--a always,exit -F arch=b64 -S add_key -F auid>=1000 -F auid!=4294967295 -k dirtyfail-rxkey
-
-# unshare() with CLONE_NEWUSER (filter on PID-namespaces nesting?)
-# Note: this fires on every unprivileged container, so filter aggressively.
+```bash
+sudo install -m 0640 tools/99-dirtyfail.rules /etc/audit/rules.d/
+sudo augenrules --load
+sudo systemctl restart auditd
 ```
 
-After loading: `sudo augenrules --load && sudo systemctl restart auditd`.
+Search for events:
 
-Search for events: `sudo ausearch -k dirtyfail-xfrm`.
+```bash
+# grep is more reliable than ausearch on distros that use ENRICHED
+# log_format (Debian 13, Fedora 44 — ausearch -k can return "no matches"
+# even when SYSCALL events with the key are present in the file).
+sudo grep -E 'type=SYSCALL.*key="dirtyfail-' /var/log/audit/audit.log | tail -20
+
+# Or per-key, only the most recent entries:
+sudo grep 'key="dirtyfail-xfrm"'    /var/log/audit/audit.log | tail -5
+sudo grep 'key="dirtyfail-rxkey"'   /var/log/audit/audit.log | tail -5
+sudo grep 'key="dirtyfail-userns"'  /var/log/audit/audit.log | tail -5
+sudo grep 'key="dirtyfail-afalg"'   /var/log/audit/audit.log | tail -5
+```
+
+(`sudo ausearch -k <key>` is the documented tool for this and works on
+older distros, but enriched-format compat issues mean `grep` is the
+safer default.)
+
+The `dirtyfail-userns` rule fires on every legitimate `unshare -U` and
+rootless container start — pair it with `dirtyfail-xfrm` in a SIEM
+correlation rule (same auid, both within ~5s) for a high-fidelity
+alert. Tuning notes inline in the rules file.
 
 ### eBPF / falco (if you have it)
 
@@ -177,7 +200,8 @@ grep -E '^[^:]+::0:0:|^[^:]+:x:0000:' /etc/passwd
 ```
 SCAN this host:
   curl ... | bash                     # bash check (no compile)
-  ./dirtyfail --scan                  # full active probe
+  ./dirtyfail --scan                  # preconds + Copy Fail probe (~1s)
+  ./dirtyfail --scan --active         # all 5 sentinel-STORE probes (~10s)
 
 MITIGATE (Ubuntu / fleet-wide):
   sudo ./dirtyfail --mitigate         # one-shot defensive deployment

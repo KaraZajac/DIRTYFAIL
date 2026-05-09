@@ -34,4 +34,13 @@ df_result_t dirtyfrag_esp6_detect(void);
 df_result_t dirtyfrag_esp6_exploit(bool do_shell);
 df_result_t dirtyfrag_esp6_exploit_inner(void);
 
+/* Active probe: fires the v6 ESP-in-UDP trigger against a /tmp sentinel
+ * file (never /etc/passwd) and reports whether the marker landed.
+ * Used by `--scan --active`. Returns DF_VULNERABLE on marker hit, DF_OK
+ * if the kernel is patched (no STORE), DF_PRECOND_FAIL if AA-blocked.
+ * The inner half runs in the bypass userns and reads
+ * DIRTYFAIL_PROBE_SENTINEL for the target path. */
+df_result_t dirtyfrag_esp6_active_probe(void);
+df_result_t dirtyfrag_esp6_active_probe_inner(void);
+
 #endif

