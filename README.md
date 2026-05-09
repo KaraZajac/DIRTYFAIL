@@ -47,23 +47,58 @@ vulnerable system.
 
 ## Verified working on
 
-DIRTYFAIL has been **empirically validated end-to-end** on real
-hardware for the following kernels:
+DIRTYFAIL has been **empirically validated end-to-end** across multiple
+distros and kernel versions. The matrix below reflects per-mode test
+results from running each `--exploit-*` mode against a fresh install
+of each distro.
 
-| Distro | Kernel | xfrm-ESP v4 | xfrm-ESP v6 | RxRPC | GCM | Backdoor |
-|---|---|:-:|:-:|:-:|:-:|:-:|
-| Ubuntu 24.04 LTS | `6.8.0-111-generic` | ✅ | ✅ | ✅ | ✅¹ | ✅¹ |
+| Distro | Kernel | LSM | Copy Fail | xfrm-ESP v4 | xfrm-ESP v6 | RxRPC | GCM | Backdoor |
+|---|---|---|:-:|:-:|:-:|:-:|:-:|:-:|
+| Ubuntu 24.04 LTS | `6.8.0-111-generic` | AppArmor | 🛡²  | ✅ | ✅ | ✅ | ✅¹ | ✅¹ |
+| Debian 13.4 | `6.12.86+deb13` | none | 🛡 | 🛡 | 🛡 | 🛡 | 🛡 | 🛡 |
+| AlmaLinux 10.1 | `6.12.0-124.8.1.el10_1` | SELinux | ✅ | ✅ | ✅ | ⏭³ | ✅ | ✅ |
+| Fedora 44 (Server) | `6.19.10-300.fc44` | SELinux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Ubuntu 26.04 LTS | `7.0.0-15-generic` | AppArmor (hardened) | 🛡 | ⚠️⁴ | ⚠️⁴ | ⚠️⁴ | ⚠️⁴ | ⚠️⁴ |
+
+**Legend:** ✅ exploit landed and produced real init-ns root  · 🛡 kernel patched (exploit ran but STORE didn't take)  · ⏭ not applicable (precondition missing)  · ⚠️ infrastructure broken (not a kernel-level patch — see below)
 
 ¹ GCM and Backdoor require `algif_aead` to be loadable. Ubuntu 24.04
 ships `/etc/modprobe.d/disable-algif_aead.conf` blacklisting it as a
 Copy Fail mitigation. With the blacklist removed (e.g. on a kernel
 predating the mitigation), both modes work end-to-end.
 
-For the RxRPC variant, we proved real init-namespace root by reading
-`/etc/shadow` (`root:*:19962:0:99999:7:::`) after `echo "" | su -`
-returned `uid=0(root)`. For the backdoor mode, `echo "" | su - dirtyfail`
-likewise dropped a real root shell. These are not userns-uid-0 ghosts —
-they are real init-ns root.
+² Copy Fail's algif_aead path is mitigated by the modprobe blacklist;
+the underlying CVE primitive in the kernel is the same whether
+`authencesn` is reachable. xfrm-ESP, RxRPC, and the GCM variant all
+land on the same kernel because they don't go through algif_aead.
+
+³ AlmaLinux 10's `kernel-modules-extra` package is not installed by
+default on a Minimal install, so `rxrpc.ko` is missing on disk.
+Installing `kernel-modules-extra-$(uname -r)` from EPEL or the AlmaLinux
+extras repo brings the module back; on a stock minimal install RxRPC is
+unreachable.
+
+⁴ **Ubuntu 26.04 LTS hardened the AppArmor user-namespace restriction.**
+The `crun` AppArmor profile is now path-attached to `/usr/bin/crun`,
+so our `change_onexec("crun")` + `execv` lands us in the
+`crun//&unconfined` sub-profile rather than `crun` itself. The
+sub-profile inherits the `unprivileged_userns` policy
+(`audit deny capability`), so `uid_map` writes return EPERM and
+`setresuid(0)` fails with EINVAL. The DIRTYFAIL binary fires every
+prompt and reaches stage 2 of the bypass, but cannot acquire caps
+inside the userns. **This is not a kernel-level patch — the bug is
+still present** — but the exploit infrastructure is blocked by AA
+hardening. Bypass options not yet implemented:
+
+- Path-spoofed exec (e.g. `aa-exec -p crun /home/kara/.../dirtyfail`)
+- `crun` running our binary as a child container
+- Targeted profile installation (requires root, defeats the point)
+
+Test reproducibility:
+
+- We re-installed each distro from a clean ISO, set up SSH key auth + NOPASSWD sudo, cloned and built DIRTYFAIL on each, took a `clean-build` Parallels snapshot, then ran all 5 exploit modes with `--no-shell` (auto-revert via fadvise + drop_caches).
+- Empirical result rows are derived from parsing the actual `--exploit-*` output, looking for the success signals: `page cache now reports <user> with uid 0`, `root password field is now empty`, `is now uid 0` (backdoor), or any of the failure patterns (`write did not land`, `byte flip failed`, `setresuid: Invalid`, `add_rxrpc_key: No such device`, `page cache not in expected shape`).
+- For the RxRPC and Backdoor "real root" verification we drove `echo "" | su - root` / `echo "" | su - dirtyfail` and confirmed `uid=0(root)` plus successful read of `/etc/shadow`.
 
 > **Authorized testing only.** Use DIRTYFAIL only on systems you own or
 > are explicitly engaged to assess. The exploit modes corrupt
