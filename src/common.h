@@ -75,6 +75,12 @@ extern bool dirtyfail_use_color;
  * probe per mode in addition to precondition checks. Set by --active. */
 extern bool dirtyfail_active_probes;
 
+/* When true, --no-shell mode skips the auto-revert step — the page-cache
+ * plant survives until --cleanup or drop_caches. Used by the
+ * container-escape demo to show that the corruption crosses namespace
+ * boundaries. Set by --no-revert. */
+extern bool dirtyfail_no_revert;
+
 void log_step (const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void log_ok   (const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void log_bad  (const char *fmt, ...) __attribute__((format(printf, 1, 2)));
