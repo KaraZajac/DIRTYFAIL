@@ -298,12 +298,14 @@ int apparmor_bypass_fork_arm(int argc, char **argv)
 int apparmor_bypass_arm_and_relaunch(int argc, char **argv)
 {
 #ifdef __linux__
-    /* Try `crun` first (Ubuntu 24.04 ships it for OCI). If unavailable,
-     * `chrome` is the second-best candidate (most desktop installs have
-     * it). If neither, return -1 and let the caller surface the error. */
-    if (change_onexec("crun") < 0 && change_onexec("chrome") < 0) {
-        return -1;
-    }
+    /* On AppArmor-restricted systems (Ubuntu 24.04+), switch to an
+     * unconfined profile via change_onexec so the post-exec userns
+     * unshare retains caps. On non-AppArmor systems
+     * (Debian/Alma/Fedora/etc.) /proc/self/attr/exec doesn't exist,
+     * change_onexec fails — that's fine, unshare works without any
+     * profile gymnastics on those kernels. Fail through gracefully. */
+    if (change_onexec("crun") < 0)
+        change_onexec("chrome");   /* best effort, both may no-op */
 
     /* Build a new argv: [argv[0], AA_STAGE1_TAG, original argv[1..]]. */
     char **na = calloc(argc + 2, sizeof(char *));
