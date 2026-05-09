@@ -12,11 +12,12 @@ and may need re-verification as the kernel evolves.
 
 ### TL;DR
 
-Seven kernel paths beyond the published CVEs were audited for the
-same in-place-AEAD-over-splice-pinned-pages bug class. **All seven
-are structurally immune.** Three additional candidates (espintcp,
-OpenVPN kernel offload, SCTP-AUTH) remain as future follow-up —
-see §1.5.
+Ten kernel paths beyond the published CVEs were audited for the
+same in-place-AEAD-over-splice-pinned-pages bug class. **All ten
+are structurally immune.** No undisclosed CVE candidates surfaced
+in this audit; the bug class is genuinely tightly scoped to the
+three published sinks plus the algif_aead authencesn/rfc4106-gcm
+primitives.
 
 ### The vulnerable pattern
 
@@ -55,6 +56,9 @@ primitives that share the in-place destination scatterlist pattern.
 | **tls_sw send encrypt + MSG_SPLICE_PAGES** | YES (read-only on user pages) | n/a (msg_en allocated separately) | yes (msg_pl) but only as src | NOT vulnerable — separate src/dst |
 | **WireGuard `decrypt_packet`** | ✅ ChaCha20Poly1305 in-place | **UNCONDITIONAL** at line 252 | yes via UDP rx (but COW protects) | NOT vulnerable — structurally immune |
 | **algif_skcipher `_skcipher_recvmsg`** | ✅ symmetric in-place possible | n/a (different module structure) | src yes (TX SGL), dst no (recv iovec) | NOT vulnerable — separate src/dst |
+| **espintcp** (ESP-in-TCP) | n/a (delegates) | n/a | reaches esp_input via xfrm_rcv_encap | inherits f4c50a4034e6 patch — NOT a new CVE |
+| **OpenVPN kernel offload `ovpn_aead_decrypt`** | ✅ AEAD in-place | **UNCONDITIONAL** at line 210 | yes via UDP rx (but COW protects) | NOT vulnerable — structurally immune |
+| **SCTP-AUTH `sctp_auth_calculate_hmac`** | HMAC only (no decrypt, no destination write into skb data frags) | n/a | n/a — digest writes to auth chunk header (kernel-allocated), not data frags | NOT vulnerable — read-only over data |
 
 ### §1.2 Eliminated paths — why each is immune
 
@@ -195,6 +199,69 @@ happen to be the source's spliced pages). Plain skcipher has no AEAD
 tags, no chained scratch — clean src/dst separation. **Not
 vulnerable.**
 
+### §1.3c espintcp — IPsec ESP over TCP
+
+`net/xfrm/espintcp.c` is a *transport-layer wrapper* — it does no
+cryptographic work itself. The `handle_esp()` function delegates
+straight to `xfrm6_rcv_encap` / `xfrm4_rcv_encap`, which call into
+the standard `esp_input()` / `esp6_input()` handlers. Any skb that
+reaches the ESP path through espintcp is processed by the same code
+that was patched by f4c50a4034e6 (SKBFL_SHARED_FRAG check).
+
+**Verdict: not a separate CVE.** On unpatched kernels, espintcp is
+just an alternative transport for the existing CVE-2026-43284 sink
+(esp_input). On patched kernels the same fix covers both UDP and TCP
+encapsulation. The SHARED_FRAG flag is set wherever splice can plant
+pages into TCP send buffers, and the producer-side flagging
+propagates through TCP into the espintcp path.
+
+### §1.3d OpenVPN kernel offload — `ovpn_aead_decrypt()`
+
+New module in 6.16+ implementing OpenVPN's data channel
+(ChaCha20Poly1305 / AES-GCM) in the kernel. Receive AEAD path is in
+`drivers/net/ovpn/crypto_aead.c`:
+
+```c
+/* line ~210 */
+nfrags = skb_cow_data(skb, 0, &trailer);    /* UNCONDITIONAL */
+/* ... */
+/* line ~228 */
+skb_to_sgvec_nomark(skb, sg + 1, payload_offset, payload_len);
+/* ... */
+/* line ~239 */
+aead_request_set_crypt(req, sg, sg, payload_len + tag_size, iv);
+```
+
+In-place AEAD (`sg, sg`) — but `skb_cow_data()` is called
+unconditionally before `skb_to_sgvec_nomark` builds the scatterlist.
+Splice-pinned pages always copied to kernel-private memory before
+the AEAD runs. **Not vulnerable.** Same defensive pattern as
+WireGuard, AH, MACsec, kTLS rx.
+
+### §1.3e SCTP-AUTH HMAC validation
+
+`net/sctp/auth.c:sctp_auth_calculate_hmac()` (lines 606–642) computes
+HMAC over an SCTP AUTH chunk:
+
+```c
+data_len = skb_tail_pointer(skb) - (unsigned char *)auth;
+digest = (u8 *)(&auth->auth_hdr + 1);
+hmac_sha1_usingrawkey(asoc_key->data, asoc_key->len,
+                      (const u8 *)auth, data_len, digest);
+```
+
+The HMAC is computed READ-ONLY over the skb's chunk data. The
+digest output is written to the auth chunk's digest field
+(`&auth->auth_hdr + 1`), which on the SEND path lives in
+kernel-allocated chunk header memory — not in any user-spliced
+data fragment. On the RECEIVE path, verification computes HMAC
+over received data and compares to the sender-provided digest in a
+private buffer — pure read.
+
+The bug class requires a kernel-side WRITE to a splice-pinned page;
+SCTP-AUTH only ever READS from skb data and writes the digest to a
+kernel-allocated chunk header. **Not vulnerable.**
+
 ### §1.4 The protective patterns that distinguish safe from vulnerable
 
 Every safe path on the list achieves immunity through one of three
@@ -209,35 +276,23 @@ mechanisms, each of which removes one of the four required conditions:
    skb** — kTLS rx skbs come from TCP rx, not user splice.
    (Removes condition 4.)
 
-### §1.5 Open candidates not yet audited
+### §1.5 Out-of-scope or low-value candidates
 
-These are kernel paths that *might* match the bug class but haven't
-been fully read yet. Listed in priority order.
+The candidates that remained after §1.3a-e were all eliminated as
+not worth a deeper audit:
 
-**MEDIUM — `espintcp` (`net/xfrm/espintcp.c`)**
-IPsec ESP carried over TCP rather than UDP. Different transport,
-different `skb` shape. The mainline patch (f4c50a4034e6) probably
-covers this if it shared `esp_input` callsites, but worth confirming
-the SHARED_FRAG flag check propagated.
-
-**MEDIUM — OpenVPN kernel offload (`drivers/net/ovpn/`)**
-New module in 6.16+. ChaCha20Poly1305 / AES-GCM in-place. Less
-mature, less audited.
-
-**MEDIUM — SCTP-AUTH (`net/sctp/auth.c`)**
-HMAC validation on incoming chunks. Almost certainly uses
-`skb_cow_data` unconditionally (like AH), but worth a 30-minute
-trace to confirm. SCTP is default-enabled on RHEL/CentOS, narrower
-reach.
-
-**LOW**
-
-- AF_SMC encryption — uses kTLS/ULP underneath, probably already
-  covered by the kTLS audit.
-- io_uring crypto extensions — if any exist, would inherit AF_ALG
-  semantics.
-- Bluetooth CMTP/HIDP crypto — privileged-only, not LPE-relevant.
-- Kernel TLS NIC offload — different threat surface (NIC-side).
+- **AF_SMC encryption** — uses kTLS/ULP underneath, already covered
+  by the kTLS audit (§1.3 / §1.4b).
+- **io_uring crypto extensions** — would inherit AF_ALG semantics,
+  already covered by the algif_skcipher audit (§1.3b).
+- **Bluetooth CMTP/HIDP crypto** — privileged-only (HCI device
+  access), not an unprivileged-LPE vector.
+- **Kernel TLS NIC offload** — encryption runs on the NIC firmware,
+  different threat surface entirely (firmware-side bug, not
+  page-cache-write).
+- **dm-crypt / fscrypt** — block-layer / filesystem-layer
+  encryption. Different threat model; user can't splice arbitrary
+  page-cache pages into block requests in any meaningful way.
 
 ### §1.6 Methodology
 
