@@ -189,6 +189,7 @@ Test reproducibility:
 - [`tools/dirtyfail-check.sh`](tools/dirtyfail-check.sh) — standalone bash detector for sysadmins (no compilation needed).
 - [`tools/99-dirtyfail.rules`](tools/99-dirtyfail.rules) — ready-to-load auditd rules for the exploit chain.
 - [`tools/dirtyfail-container-escape.sh`](tools/dirtyfail-container-escape.sh) — cross-namespace blast-radius demo.
+- [`tools/exploit_su_aarch64.S`](tools/exploit_su_aarch64.S) — aarch64 (ARM64) shellcode source for `--exploit-su`. Hardware-untested; ships gated behind `DIRTYFAIL_AARCH64_TRUST_UNTESTED=1`. Regenerate the corresponding bytes in `src/exploit_su.c` with `aarch64-linux-gnu-as` to verify.
 
 ---
 

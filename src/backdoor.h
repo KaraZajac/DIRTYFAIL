@@ -52,4 +52,8 @@ df_result_t backdoor_cleanup(void);
 df_result_t backdoor_install_inner(void);
 df_result_t backdoor_cleanup_inner(void);
 
+/* Used by --list-state. Returns true if a backdoor state file is present
+ * (and prints a summary), false if no file exists. Side-effect free. */
+bool backdoor_list_state(void);
+
 #endif
