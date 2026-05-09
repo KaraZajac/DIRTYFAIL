@@ -69,12 +69,12 @@ df_result_t mitigate_apply(void)
     log_warn("  2. unload those modules if loaded");
     log_warn("  3. set kernel.apparmor_restrict_unprivileged_userns=1 (where AA loaded)");
     log_warn("  4. drop page cache");
-    log_warn("");
+    fputc('\n', stderr);
     log_warn("SIDE EFFECTS:");
     log_warn("  - blacklisting esp4/esp6 BREAKS IPsec / strongSwan / libreswan VPNs");
     log_warn("  - blacklisting rxrpc BREAKS AFS distributed file system clients");
     log_warn("  - blacklisting algif_aead BREAKS userspace AEAD via AF_ALG (rare)");
-    log_warn("");
+    fputc('\n', stderr);
     log_warn("undo with `dirtyfail --cleanup-mitigate` (removes config files, leaves modules unloaded)");
 
     if (!typed_confirm("DIRTYFAIL")) {
@@ -144,15 +144,15 @@ df_result_t mitigate_apply(void)
         if (n == 2) log_ok("dropped page cache");
     }
 
-    log_ok("");
+    fputc('\n', stdout);
     log_ok("=== mitigation summary ===");
     log_ok("  modprobe blacklist:  %s", MODPROBE_CONF);
     log_ok("  sysctl persistence:  %s", SYSCTL_CONF);
     log_ok("  modules unloaded:    algif_aead, esp4, esp6, rxrpc (where loaded)");
-    log_hint("");
+    fputc('\n', stdout);
     log_hint("Re-verify with `dirtyfail --scan` — should now report most modes as");
     log_hint("preconditions missing or mitigated.");
-    log_hint("");
+    fputc('\n', stdout);
     log_hint("Ultimate fix: install kernel update with f4c50a4034e6 backport.");
     return DF_OK;
 }

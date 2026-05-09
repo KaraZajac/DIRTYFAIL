@@ -119,10 +119,13 @@
 #define SIOCSIFFLAGS     0x8914
 struct sockaddr_in { int dummy; };
 struct ifreq      { int dummy; };
+__attribute__((unused))
 static ssize_t splice (int a, void *b, int c, void *d, size_t e, unsigned f)
 { (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; errno=ENOSYS; return -1; }
+__attribute__((unused))
 static ssize_t vmsplice(int a, const struct iovec *b, unsigned long c, unsigned d)
 { (void)a;(void)b;(void)c;(void)d; errno=ENOSYS; return -1; }
+__attribute__((unused))
 static int     ioctl  (int a, unsigned long b, ...)
 { (void)a;(void)b; errno=ENOSYS; return -1; }
 #else
@@ -480,6 +483,7 @@ static bool trigger_store(off_t passwd_off)
     return trigger_store_at("/etc/passwd", passwd_off);
 }
 
+__attribute__((unused))
 static int run_in_userns(off_t passwd_off, uid_t real_uid, gid_t real_gid)
 {
     if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNET) != 0) {
@@ -533,6 +537,7 @@ static int run_in_userns(off_t passwd_off, uid_t real_uid, gid_t real_gid)
 }
 
 #else  /* __linux__ */
+__attribute__((unused))
 static int run_in_userns(off_t passwd_off, uid_t real_uid, gid_t real_gid)
 {
     (void)passwd_off; (void)real_uid; (void)real_gid;

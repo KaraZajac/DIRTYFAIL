@@ -451,6 +451,8 @@ static bool trigger_store_v6(off_t passwd_off)
     return trigger_store_v6_at("/etc/passwd", off);
 }
 
+__attribute__((unused))
+
 static int run_v6_in_userns(off_t passwd_off, uid_t real_uid, gid_t real_gid)
 {
     if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNET) != 0) {
@@ -489,6 +491,7 @@ static int run_v6_in_userns(off_t passwd_off, uid_t real_uid, gid_t real_gid)
 }
 
 #else
+__attribute__((unused))
 static int run_v6_in_userns(off_t a, uid_t b, gid_t c) {
     (void)a; (void)b; (void)c; return 1;
 }

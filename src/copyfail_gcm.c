@@ -55,6 +55,7 @@ extern ssize_t splice(int fd_in, loff_t *off_in, int fd_out, loff_t *off_out,
 /* Fixed AEAD key (16-byte AES key + 4-byte salt). Both are attacker-
  * chosen — auth verification will fail at the end of decrypt anyway,
  * the STORE has already happened by then. */
+__attribute__((unused))
 static const unsigned char AEAD_KEY[KEY_TOTAL] = {
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
     0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
@@ -561,11 +562,12 @@ df_result_t copyfail_gcm_active_probe_inner(void)
         return DF_TEST_ERROR;
     }
 
-    /* Arbitrary fixed IV — keystream is then deterministic but we
-     * don't need to predict it. */
+    /* Arbitrary fixed 8-byte wire IV (rfc4106 wraps it with the 4-byte
+     * SA salt to form the 12-byte GCM nonce). Keystream is deterministic
+     * given this IV + key, but we don't need to predict it for the
+     * probe — any byte change in sentinel[0] proves the STORE happened. */
     static const uint8_t probe_iv[IV_LEN] = {
-        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02,
-        0x03, 0x04, 0x05, 0x06, 0x07, 0x08
+        0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04
     };
 
     if (!gcm_install_sa(probe_iv)) {

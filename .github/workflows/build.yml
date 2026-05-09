@@ -1,0 +1,50 @@
+# DIRTYFAIL — CI: build + selftests on every push.
+#
+# We don't run --exploit-* anywhere — that requires kernel surface
+# (algif_aead, AF_RXRPC, etc.) and root, neither available in
+# GitHub-hosted runners. The selftests in tests/ are scoped to the
+# pure-userspace primitives (fcrypt cipher, AF_ALG ecb(aes)) which
+# the runner kernel does support.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ${{ matrix.cc }}
+
+      - name: build (CC=${{ matrix.cc }})
+        run: make CC=${{ matrix.cc }} 2>&1 | tee build.log
+        env:
+          CC: ${{ matrix.cc }}
+
+      - name: zero warnings policy
+        run: |
+          if grep -E 'warning:|error:' build.log; then
+            echo "::error::compiler warnings or errors detected"
+            exit 1
+          fi
+
+      - name: run primitive selftests
+        run: make test CC=${{ matrix.cc }}
+
+      - name: --version smoke test
+        run: ./dirtyfail --version
+
+      - name: --help smoke test
+        run: ./dirtyfail --help | head -5

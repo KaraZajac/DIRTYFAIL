@@ -86,9 +86,11 @@
 #define SYS_add_key   0
 struct ifreq { char ifr_name[IFNAMSIZ]; short ifr_flags; };
 typedef int  loff_t;
+__attribute__((unused))
 static inline ssize_t splice  (int a, loff_t *b, int c, loff_t *d,
                                size_t e, unsigned f) {
     (void)a;(void)b;(void)c;(void)d;(void)e;(void)f; return -1; }
+__attribute__((unused))
 static inline ssize_t vmsplice(int a, const struct iovec *b, unsigned long c,
                                unsigned d) {
     (void)a;(void)b;(void)c;(void)d; return -1; }
@@ -243,6 +245,7 @@ static bool write_proc_str(const char *path, const char *value)
 
 /* ---- userns / netns setup ------------------------------------------- */
 
+__attribute__((unused))
 static bool setup_userns(uid_t real_uid, gid_t real_gid)
 {
     if (syscall(SYS_unshare, CLONE_NEWUSER | CLONE_NEWNET) < 0) {
@@ -489,7 +492,8 @@ static int setup_rxrpc_client(uint16_t local_port, const char *keyname)
 static int rxrpc_initiate_call(int fd, uint16_t srv_port,
                                uint16_t svc_id, unsigned long user_call_id)
 {
-    char data[8] = "PINGPING";
+    /* Wire payload — fixed 8 bytes, not C-string semantics. */
+    char data[8] = { 'P','I','N','G','P','I','N','G' };
     struct dfr_sockaddr_rxrpc srx;
     memset(&srx, 0, sizeof(srx));
     srx.srx_family    = AF_RXRPC;
