@@ -58,9 +58,9 @@ of each distro.
 | Debian 13.4 | `6.12.86+deb13` | none | 🛡 | 🛡 | 🛡 | 🛡 | 🛡 | 🛡 |
 | AlmaLinux 10.1 | `6.12.0-124.8.1.el10_1` | SELinux | ✅ | ✅ | ✅ | ⏭³ | ✅ | ✅ |
 | Fedora 44 (Server) | `6.19.10-300.fc44` | SELinux | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Ubuntu 26.04 LTS | `7.0.0-15-generic` | AppArmor (hardened) | 🛡 | ⚠️⁴ | ⚠️⁴ | ⚠️⁴ | ⚠️⁴ | ⚠️⁴ |
+| Ubuntu 26.04 LTS | `7.0.0-15-generic` | AppArmor (hardened) | 🛡 | 🛡⁴ | 🛡⁴ | 🛡⁴ | 🛡⁴ | 🛡⁴ |
 
-**Legend:** ✅ exploit landed and produced real init-ns root  · 🛡 kernel patched (exploit ran but STORE didn't take)  · ⏭ not applicable (precondition missing)  · ⚠️ infrastructure broken (not a kernel-level patch — see below)
+**Legend:** ✅ exploit landed and produced real init-ns root  · 🛡 mitigated — exploit cannot reach kernel bug (kernel patched OR LSM blocks unprivileged path)  · ⏭ not applicable (precondition missing)
 
 ¹ GCM and Backdoor require `algif_aead` to be loadable. Ubuntu 24.04
 ships `/etc/modprobe.d/disable-algif_aead.conf` blacklisting it as a
@@ -78,21 +78,39 @@ Installing `kernel-modules-extra-$(uname -r)` from EPEL or the AlmaLinux
 extras repo brings the module back; on a stock minimal install RxRPC is
 unreachable.
 
-⁴ **Ubuntu 26.04 LTS hardened the AppArmor user-namespace restriction.**
-The `crun` AppArmor profile is now path-attached to `/usr/bin/crun`,
-so our `change_onexec("crun")` + `execv` lands us in the
-`crun//&unconfined` sub-profile rather than `crun` itself. The
-sub-profile inherits the `unprivileged_userns` policy
-(`audit deny capability`), so `uid_map` writes return EPERM and
-`setresuid(0)` fails with EINVAL. The DIRTYFAIL binary fires every
-prompt and reaches stage 2 of the bypass, but cannot acquire caps
-inside the userns. **This is not a kernel-level patch — the bug is
-still present** — but the exploit infrastructure is blocked by AA
-hardening. Bypass options not yet implemented:
+⁴ **Ubuntu 26.04 LTS comprehensively blocks unprivileged exploitation.**
+The shipping kernel `7.0.0-15.15` (released 2026-04-22) **predates the
+mainline patch `f4c50a4034e6` (merged 2026-05-07) by ~2 weeks** — so
+the bug IS still present in the kernel. Ubuntu's defense is
+**defense-in-depth via AppArmor hardening**, not a kernel patch:
 
-- Path-spoofed exec (e.g. `aa-exec -p crun /home/kara/.../dirtyfail`)
-- `crun` running our binary as a child container
-- Targeted profile installation (requires root, defeats the point)
+- `apparmor_restrict_unprivileged_userns=1` is enabled by default.
+- On `unshare(CLONE_NEWUSER)`, the kernel-level AppArmor enforcement
+  auto-transitions ANY profile (including `(unconfined)`-flagged ones
+  like `crun`, `chrome`, default `unconfined`) to a
+  `<profile>//&unprivileged_userns (mixed)` sub-profile that has
+  `audit deny capability`. uid 0 inside the new userns gets no caps.
+- `change_onexec` to a different profile doesn't help — even the
+  `crun` profile (which has explicit `userns,` permission and
+  `flags=(unconfined)`) auto-transitions on unshare. Verified via
+  `aa-exec -p crun bash -c 'unshare -U -n cat /proc/self/attr/current'`
+  → `crun//&unprivileged_userns (mixed)`.
+- `newuidmap`/`newgidmap` (setuid root) successfully writes uid_map,
+  but `setresuid(0)` then succeeds while `ioctl(SIOCSIFFLAGS)` and
+  every other CAP_NET_ADMIN-gated syscall returns EPERM because the
+  capability denial is per-namespace, not per-uid.
+
+The DIRTYFAIL binary correctly armes its bypass and reaches stage 2,
+but cannot acquire CAP_NET_ADMIN inside the new userns. The exploit
+infrastructure is blocked at the LSM layer regardless of bypass
+technique. We tested `change_onexec(crun)`, `change_onexec(chrome)`,
+`aa-exec -p <profile>`, and direct `unshare(USER|NET) + newuidmap`
+— all produce the same `unprivileged_userns` sub-profile.
+
+**This is good security work by Canonical.** The bug class is
+mitigated for unprivileged users without requiring a kernel rebuild.
+A subsequent stable update will likely also bring the kernel patch
+proper, completing the defense.
 
 Test reproducibility:
 
