@@ -172,6 +172,13 @@ Test reproducibility:
 10. [Ethics & disclosure](#10-ethics--disclosure)
 11. [Credits](#11-credits)
 
+**Companion docs:**
+- [`docs/DEFENDERS.md`](docs/DEFENDERS.md) — sysadmin playbook: am I vulnerable, how to mitigate, what to monitor.
+- [`docs/RESEARCH.md`](docs/RESEARCH.md) — kernel-source audit of adjacent paths (AH, IPCOMP, MACsec, kTLS, etc.) for the same bug class.
+- [`tools/dirtyfail-check.sh`](tools/dirtyfail-check.sh) — standalone bash detector for sysadmins (no compilation needed).
+- [`tools/99-dirtyfail.rules`](tools/99-dirtyfail.rules) — ready-to-load auditd rules for the exploit chain.
+- [`tools/dirtyfail-container-escape.sh`](tools/dirtyfail-container-escape.sh) — cross-namespace blast-radius demo.
+
 ---
 
 ## 1. The bug class
